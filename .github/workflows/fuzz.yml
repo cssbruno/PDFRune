@@ -1,0 +1,30 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fuzz existing-PDF boundaries
+        run: |
+          go test ./importpdf -run '^$' -fuzz '^FuzzOpenBytes$' -fuzztime=10s
+          go test ./pdfcdr -run '^$' -fuzz '^FuzzSanitizePDF$' -fuzztime=10s
+          go test ./inspect -run '^$' -fuzz '^FuzzDecodedStreamsAndText$' -fuzztime=10s
+          go test ./sign -run '^$' -fuzz '^FuzzVerifyCMS$' -fuzztime=10s
+          go test ./sign -run '^$' -fuzz '^FuzzPDFSignatureScanner$' -fuzztime=10s
+          go test ./sign -run '^$' -fuzz '^FuzzAnalyzePDF$' -fuzztime=10s

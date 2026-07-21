@@ -1,0 +1,160 @@
+PaperRune Health-Sector Restricted License
+Version 1.0, 17 July 2026
+
+Copyright (c) PaperRune contributors and other copyright holders identified in
+the applicable source-file notices.
+
+This is a source-available license. It is not an OSI-approved open-source
+license. The health-sector restriction in this License is intentional.
+
+1. Definitions
+--------------
+
+1.1. "Software" means the source code, object code, documentation, examples,
+and other material in this repository that is identified as being provided
+under this License.
+
+1.2. "Licensor" means the copyright holder or copyright holders who make the
+applicable Software available under this License.
+
+1.3. "You" means an individual or legal entity exercising rights under this
+License.
+
+1.4. "Health-Sector Organization" means a legal entity whose business,
+product, service, or principal operation involves healthcare delivery,
+clinical or medical services, hospitals, clinics, laboratories, diagnostics,
+pharmaceuticals, biotechnology, medical devices, health insurance, or the
+management or processing of regulated health information. It also includes a
+contractor, reseller, service provider, or other person acting on behalf of a
+Health-Sector Organization for those activities.
+
+1.5. "Health-Sector Use" means use of the Software by a Health-Sector
+Organization in, or for, its health-sector business or operations, including
+developing, testing, deploying, distributing, operating, supporting, or
+providing a product or service for those activities. Health-Sector Use is
+restricted whether it is commercial or non-commercial.
+
+1.6. "Non-Health-Sector Use" means any use that is not Health-Sector Use.
+
+2. Copyright License
+--------------------
+
+Subject to this License, each Licensor grants You a worldwide, royalty-free,
+non-exclusive license to use, reproduce, modify, prepare
+derivative works of, display, perform, distribute, and sublicense the
+Software, in source or object form, solely for Non-Health-Sector Use.
+
+This license grant includes the right to use the Software in commercial
+products and services, provided that the use is Non-Health-Sector Use and all
+other terms of this License are followed.
+
+3. Health-Sector Licensing Requirement
+---------------------------------------
+
+A Health-Sector Organization may not exercise any right granted by Section 2
+for Health-Sector Use under this License. Before making any Health-Sector Use,
+the Health-Sector Organization must obtain a separate written commercial
+license and any required permission from the Licensor.
+
+A contractor, reseller, service provider, or other person acting for a
+Health-Sector Organization may not avoid this requirement by obtaining or
+using the Software in its own name. The separate written license must cover
+the specific Health-Sector Use and must be signed by an authorized
+representative of the Licensor.
+
+Nothing in this License grants permission to use the Software for a
+Health-Sector Use merely because the Software is publicly available, its
+source code can be viewed, or a copy was obtained from a public repository.
+
+4. Distribution Conditions
+--------------------------
+
+You may distribute the Software or a derivative work for Non-Health-Sector
+Use only if You:
+
+  a. include a copy of this License with the distribution;
+
+  b. retain all copyright, license, attribution, and disclaimer notices;
+
+  c. clearly identify any files that You modified; and
+
+  d. do not state or imply that the Licensor endorses Your product or service.
+
+You may license Your own, separate code under terms of Your choice. Those
+terms must not remove or limit the rights, conditions, or Health-Sector
+licensing requirement that apply to the Software under this License.
+
+You may not relicense the Software, or any derivative work containing it, in a
+way that permits Health-Sector Use without the separate written license
+required by Section 3.
+
+5. Third-Party Material
+-----------------------
+
+The Software may include or be distributed with material provided by third
+parties under separate license terms. Those terms continue to apply to that
+material. This License does not grant rights to third-party material that the
+Licensor does not own or control.
+
+6. Trademarks and Patent Rights
+-------------------------------
+
+This License does not grant any right to use the names, logos, or trademarks
+of the Licensor or its contributors, except as reasonably necessary to comply
+with the notice requirements of this License.
+
+No patent license is granted by this License. Any patent rights are licensed
+only under a separate written agreement, if any.
+
+7. Termination
+--------------
+
+The rights granted by this License terminate automatically if You materially
+violate its terms, including by making an unlicensed Health-Sector Use. The
+rights will be reinstated if You stop the violation and cure it within thirty
+(30) days after receiving written notice of the violation, unless the Licensor
+has already notified You that the termination is final.
+
+Termination does not affect rights that were validly granted to recipients
+before termination, provided those recipients continue to comply with this
+License. Sections 3, 5, 6, 8, and 9 survive termination to the extent needed
+to give them effect.
+
+8. Disclaimer of Warranty
+-------------------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, AND THAT THE SOFTWARE IS
+FREE OF DEFECTS OR SUITABLE FOR CLINICAL, MEDICAL, SAFETY-CRITICAL, OR
+REGULATED USE. YOU ARE SOLELY RESPONSIBLE FOR VALIDATING THE SOFTWARE AND
+FOR COMPLYING WITH ALL LAWS, REGULATIONS, STANDARDS, AND PROFESSIONAL
+REQUIREMENTS THAT APPLY TO YOUR USE.
+
+9. Limitation of Liability
+--------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, NO LICENSOR OR CONTRIBUTOR WILL BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY,
+CONSEQUENTIAL, OR OTHER DAMAGES, INCLUDING LOSS OF PROFITS, DATA, BUSINESS,
+OR GOODWILL, ARISING FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE, UNDER
+ANY THEORY OF LIABILITY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+10. General Terms
+-----------------
+
+This License is the entire agreement governing the Software under these
+terms. If a provision is held unenforceable, it will be modified only as much
+as necessary to make it enforceable, and the remaining provisions will remain
+in effect. No waiver is effective unless made in writing by the party
+granting it.
+
+This License does not limit rights that cannot legally be limited, including
+applicable copyright exceptions and limitations. It does not grant rights to
+use the Software in violation of applicable law.
+
+The Licensor may publish later versions of this License. Software received
+under this version remains governed by this version unless the Licensor
+expressly states that it is being relicensed under a later version.
+
+SPDX identifier: LicenseRef-PaperRune-Health-Sector-Restricted-1.0
