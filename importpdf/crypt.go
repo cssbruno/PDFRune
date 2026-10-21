@@ -144,6 +144,36 @@ func v4CryptMethod(encrypt pdfDict, filterKey string) (pdfCryptMethod, error) {
 	}
 }
 
+// defaultKeyBits is the key length used when the encryption dictionary has no
+// top-level /Length. That entry belongs to V 2 and 3; under V 4 the length
+// comes from the stream crypt filter, where AESV2 is always 128 bits and
+// writers record /Length in bytes as often as in bits.
+func defaultKeyBits(encrypt pdfDict, v int) int {
+	if v != 4 {
+		return 40
+	}
+	name := encrypt["StmF"]
+	filters := encrypt["CF"]
+	if name.kind != pdfValueName || filters.kind != pdfValueDict {
+		return 128
+	}
+	filter := filters.dict[name.name]
+	if filter.kind != pdfValueDict {
+		return 128
+	}
+	if method := filter.dict["CFM"]; method.kind == pdfValueName && method.name == "AESV2" {
+		return 128
+	}
+	length, err := optionalPDFInt(filter.dict, "Length", 128)
+	if err != nil {
+		return 128
+	}
+	if length > 0 && length <= 16 {
+		return length * 8
+	}
+	return length
+}
+
 // authenticateRC4MD5 implements ISO 32000-1 algorithms 2, 4, 5 and 7: the
 // password is tried first as the user password and then as the owner password.
 func authenticateRC4MD5(encrypt pdfDict, v, r int, encryptMetadata bool, password string, owner, user, firstID []byte) ([]byte, error) {
@@ -152,7 +182,7 @@ func authenticateRC4MD5(encrypt pdfDict, v, r int, encryptMetadata bool, passwor
 	}
 	keyLength := 5
 	if r >= 3 {
-		bits, err := optionalPDFInt(encrypt, "Length", 40)
+		bits, err := optionalPDFInt(encrypt, "Length", defaultKeyBits(encrypt, v))
 		if err != nil {
 			return nil, err
 		}

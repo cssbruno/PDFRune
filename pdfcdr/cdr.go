@@ -539,6 +539,17 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	// nameMapRole keeps a reference made in the resource-name map role in that
+	// role only when the object has the shape of a name map. A shading reached
+	// through a pattern's /Shading, for one, is an ordinary object and gets the
+	// full policy.
+	nameMapRole := func(key refKey, preserveKeys bool) bool {
+		if !preserveKeys {
+			return false
+		}
+		ref, ok := byKey[key]
+		return !ok || objectIsResourceNameMap(objects[ref])
+	}
 	// roleIndependent reports whether the referenced object sanitizes to the
 	// same value and child references under both roles. Only a dictionary at
 	// the top of the object is affected by the role, so a color space array
@@ -550,7 +561,7 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 			return false
 		}
 		body := inlineStreamParameterRefs(objects[ref], objects)
-		asResource, err := sanitizePDFObjectWithReferences(body, true)
+		asResource, err := sanitizePDFObjectWithReferences(body, nameMapRole(key, true))
 		if err != nil {
 			return false
 		}
@@ -563,7 +574,7 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 			sameRefKeys(asResource.normalRefs, asOrdinary.normalRefs)
 	}
 	conflict := func(resourceRefs, normalRefs map[refKey]bool) (refKey, bool) {
-		for ref := range resourceRefs {
+		for _, ref := range sortedRefKeys(resourceRefs) {
 			if normalRefs[ref] && !roleIndependent(ref) {
 				return ref, true
 			}
@@ -579,8 +590,11 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	}
 	queue := make([]queuedReference, 0, len(root.resourceNameRefs)+len(root.normalRefs))
 	roles := make(map[refKey]bool, cap(queue))
+	// Keys are visited in order so the role recorded first, which is part of
+	// the deduplication key, never depends on map iteration order.
 	enqueue := func(refs map[refKey]bool, preserveKeys bool) error {
-		for key := range refs {
+		for _, key := range sortedRefKeys(refs) {
+			preserveKeys := nameMapRole(key, preserveKeys)
 			if previous, exists := roles[key]; exists {
 				if previous != preserveKeys && !roleIndependent(key) {
 					return ambiguousResourceReferenceError(key)
@@ -647,6 +661,17 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 		return result[i].ref.ObjectNumber() < result[j].ref.ObjectNumber()
 	})
 	return result, nil
+}
+
+func sortedRefKeys(refs map[refKey]bool) []refKey {
+	keys := refKeys(refs)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].objectNumber == keys[j].objectNumber {
+			return keys[i].generation < keys[j].generation
+		}
+		return keys[i].objectNumber < keys[j].objectNumber
+	})
+	return keys
 }
 
 func sameRefKeys(left, right map[refKey]bool) bool {

@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- `sign` writes non-ASCII signature dictionary text (`/Name`, `/Reason`,
+  `/Location`, `/ContactInfo`, field `/T`) as UTF-16BE instead of `?`.
+- `sign` verification and extraction read cross-reference streams, hybrid
+  `XRefStm` files and object streams; a signed PDF 1.5+ file is no longer
+  counted as unsigned. Signing still requires classic xref tables. New
+  `CountSignatures` returns the parse error that `SignatureCount` reports as 0.
+- `sign` verification accepts SignerInfos identified by subjectKeyIdentifier,
+  RSASSA-PSS with matching hash and MGF1 hash, and signed attributes not in DER
+  order; SHA-1 (including PSS defaults) stays rejected.
+- `sign` accepts CR-only line ends and `trailer <<` on one line.
+- `sign` output with the default `ETSI.CAdES.detached` SubFilter omits the CMS
+  signing-time attribute and adds ESS signing-certificate-v2 (PAdES-B-B);
+  `adbe.pkcs7.detached` and `CreateCMS` keep signing-time.
+- `pdfcdr` gives a pattern's `/Shading` object, and any other value reached
+  through a resource category key that does not have the shape of a
+  resource-name map (a stream, or a dictionary holding a number, string or
+  boolean), the full sanitizer policy. Such a shading previously kept external
+  file keys, `/JS` and `/OpenAction`; a shading shared by the page `/Shading`
+  map and a pattern (Ghostscript output) is now accepted.
+- `pdfcdr` refuses PostScript form XObjects marked with `/Subtype2 /PS`, drops
+  `/OPI` proxies instead of refusing the document, steps over removed entries
+  without applying policy to their values, inlines an indirect `/Length`, and
+  produces the same bytes on every run for objects referenced in both roles.
+- `importpdf` repairs damaged files: a cross-reference section that does not
+  lead to its objects is rebuilt from the object headers (object streams
+  included), a single wrong xref offset is found by scanning, and a stream whose
+  `/Length` misses `endstream` is measured. Unreferenced broken entries no
+  longer fail normalization.
+- `importpdf` resolves indirect `/Kids`, `/Contents` arrays, page boxes and
+  `/Rotate`; uses the crop box as the default for the bleed, trim and art boxes
+  and inherits only the media and crop boxes; takes the V4 key length from the
+  crypt filter; ignores the `/Prev` of a hybrid file's hidden xref stream; and
+  accepts trailing spaces in xref subsection headers.
+- `importpdf` no longer loops forever on an unterminated object read through
+  `OpenReaderAt`, and no longer copies the raw bytes of a nested value once per
+  enclosing level (a 4 MB file allocated almost 500 MB).
+
 - `importpdf` reads cross-reference streams (including hybrid `XRefStm`
   files), object streams, and PNG-predicted container streams by normalizing
   them into a classic-xref file before parsing.

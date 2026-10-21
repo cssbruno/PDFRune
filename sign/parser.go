@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
@@ -52,6 +51,11 @@ type effectiveXrefEntry struct {
 	Offset     int
 	Generation int
 	InUse      bool
+	// Compressed marks an xref stream type 2 entry: the object is slot Index
+	// of object stream Stream instead of living at Offset.
+	Compressed bool
+	Stream     int
+	Index      int
 }
 
 type cachedIndirectValue struct {
@@ -64,6 +68,10 @@ type pdfXrefResolver struct {
 	entries        map[int]effectiveXrefEntry
 	indirectValues map[pdfRef]cachedIndirectValue
 	maxObject      int
+	// objectStreams caches decoded object streams by object number and
+	// containerBudget bounds the bytes decoded from xref and object streams.
+	objectStreams   map[int]*pdfObjectStream
+	containerBudget int
 }
 
 func analyzePDF(input []byte) (pdfContext, error) {
@@ -121,19 +129,39 @@ func signContextErr(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// newPDFXrefResolverContext resolves classic xref tables only, as the signer
+// needs: it appends a classic section and rewrites objects in place.
 func newPDFXrefResolverContext(ctx context.Context, input []byte, offset, maxXrefChain, maxXrefEntries int) (*pdfXrefResolver, error) {
+	return buildPDFXrefResolverContext(ctx, input, offset, maxXrefChain, maxXrefEntries, false)
+}
+
+// newPDFReadXrefResolverContext also reads cross-reference streams, hybrid
+// /XRefStm sections and compressed objects (PDF 1.5) for read-only paths.
+func newPDFReadXrefResolverContext(ctx context.Context, input []byte, offset, maxXrefChain, maxXrefEntries int) (*pdfXrefResolver, error) {
+	return buildPDFXrefResolverContext(ctx, input, offset, maxXrefChain, maxXrefEntries, true)
+}
+
+func buildPDFXrefResolverContext(ctx context.Context, input []byte, offset, maxXrefChain, maxXrefEntries int, xrefStreams bool) (*pdfXrefResolver, error) {
 	if maxXrefChain <= 0 {
 		return nil, errors.New("pdfsigning: xref chain limit must be positive")
 	}
 	if maxXrefEntries <= 0 || maxXrefEntries > maxPDFObjectCount {
 		return nil, errors.New("pdfsigning: xref entry limit must be positive")
 	}
-	resolver := &pdfXrefResolver{input: input, entries: make(map[int]effectiveXrefEntry), maxObject: -1}
+	resolver := &pdfXrefResolver{input: input, entries: make(map[int]effectiveXrefEntry), maxObject: -1, containerBudget: maxXrefContainerBytes}
+	type xrefSection struct {
+		offset int
+		hidden bool // reached through a hybrid file's /XRefStm
+	}
 	seen := make(map[int]bool)
-	for {
+	pending := []xrefSection{{offset: offset}}
+	for len(pending) > 0 {
 		if err := signContextErr(ctx); err != nil {
 			return nil, err
 		}
+		section := pending[0]
+		pending = pending[1:]
+		offset := section.offset
 		if offset < 0 || offset >= len(input) {
 			return nil, errors.New("pdfsigning: xref offset outside PDF")
 		}
@@ -144,6 +172,13 @@ func newPDFXrefResolverContext(ctx context.Context, input []byte, offset, maxXre
 			return nil, errors.New("pdfsigning: xref chain exceeds maximum size")
 		}
 		seen[offset] = true
+		classic := isClassicXrefAt(input, offset)
+		if !classic && !xrefStreams {
+			return nil, fmt.Errorf("%w: only classic xref tables are supported", ErrUnsupportedPDF)
+		}
+		if section.hidden && classic {
+			return nil, errors.New("pdfsigning: /XRefStm does not point to an xref stream")
+		}
 		trailer, err := xrefTrailerContext(ctx, input, offset)
 		if err != nil {
 			return nil, err
@@ -153,54 +188,107 @@ func newPDFXrefResolverContext(ctx context.Context, input []byte, offset, maxXre
 		} else if encrypted {
 			return nil, fmt.Errorf("%w: encrypted PDFs are not supported", ErrUnsupportedPDF)
 		}
-		tableMax, err := resolver.loadXrefTableContext(ctx, input, offset, maxXrefEntries)
+		var sectionMax int
+		if classic {
+			sectionMax, err = resolver.loadXrefTableContext(ctx, input, offset, maxXrefEntries)
+		} else {
+			sectionMax, err = resolver.loadXrefStreamContext(ctx, offset, maxXrefEntries)
+		}
 		if err != nil {
 			return nil, err
 		}
-		resolver.maxObject = max(resolver.maxObject, tableMax)
+		resolver.maxObject = max(resolver.maxObject, sectionMax)
+		// The stream a hybrid table points to only adds entries to that table;
+		// its own /Prev repeats the table's and is ignored, as readers do.
+		if section.hidden {
+			continue
+		}
+		// A hybrid table's /XRefStm section is read after the table and before
+		// /Prev, so entries the table defines keep precedence.
+		next := make([]xrefSection, 0, 2)
+		if classic && xrefStreams {
+			stream, ok, err := parseTrailerOffsetContext(ctx, trailer, "/XRefStm")
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				next = append(next, xrefSection{offset: stream, hidden: true})
+			}
+		}
 		prev, ok, err := parsePrevXrefContext(ctx, trailer)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			return resolver, nil
+		if ok {
+			next = append(next, xrefSection{offset: prev})
 		}
-		offset = prev
+		pending = append(next, pending...)
 	}
+	return resolver, nil
 }
 
+func isClassicXrefAt(input []byte, offset int) bool {
+	return offset >= 0 && offset < len(input) && bytes.HasPrefix(input[offset:], []byte("xref"))
+}
+
+// objectOffsetContext returns the file offset of an uncompressed object.
+// Objects stored in an object stream have no offset and are rejected.
 func (resolver *pdfXrefResolver) objectOffsetContext(ctx context.Context, ref pdfRef) (int, error) {
-	if resolver == nil {
-		return 0, errors.New("pdfsigning: xref resolver not initialized")
-	}
-	if err := signContextErr(ctx); err != nil {
+	entry, err := resolver.objectEntryContext(ctx, ref)
+	if err != nil {
 		return 0, err
 	}
-	entry, present := resolver.entries[ref.Object]
-	if !present {
-		return 0, fmt.Errorf("pdfsigning: object %d %d not found in xref", ref.Object, ref.Generation)
-	}
-	if !entry.InUse || entry.Generation != ref.Generation {
-		return 0, fmt.Errorf("pdfsigning: object %d %d is free or has a different generation", ref.Object, ref.Generation)
+	if entry.Compressed {
+		return 0, fmt.Errorf("%w: object %d %d is stored in an object stream", ErrUnsupportedPDF, ref.Object, ref.Generation)
 	}
 	return entry.Offset, nil
 }
 
+func (resolver *pdfXrefResolver) objectEntryContext(ctx context.Context, ref pdfRef) (effectiveXrefEntry, error) {
+	if resolver == nil {
+		return effectiveXrefEntry{}, errors.New("pdfsigning: xref resolver not initialized")
+	}
+	if err := signContextErr(ctx); err != nil {
+		return effectiveXrefEntry{}, err
+	}
+	entry, present := resolver.entries[ref.Object]
+	if !present {
+		return effectiveXrefEntry{}, fmt.Errorf("pdfsigning: object %d %d not found in xref", ref.Object, ref.Generation)
+	}
+	if !entry.InUse || entry.Generation != ref.Generation {
+		return effectiveXrefEntry{}, fmt.Errorf("pdfsigning: object %d %d is free or has a different generation", ref.Object, ref.Generation)
+	}
+	return entry, nil
+}
+
+// findStartXref reads the offset after the last startxref keyword. CR, LF
+// and CRLF are all end-of-line markers (ISO 32000-1 7.2.3).
 func findStartXref(input []byte) (int, error) {
 	idx := bytes.LastIndex(input, []byte("startxref"))
 	if idx < 0 {
 		return 0, errors.New("pdfsigning: startxref not found")
 	}
-	rest := bytes.TrimSpace(input[idx+len("startxref"):])
-	lines := bytes.Split(rest, []byte{'\n'})
-	if len(lines) == 0 {
+	pos := idx + len("startxref")
+	for pos < len(input) && isPDFWhitespace(input[pos]) {
+		pos++
+	}
+	if pos >= len(input) {
 		return 0, errors.New("pdfsigning: startxref value not found")
 	}
-	value, err := strconv.Atoi(strings.TrimSpace(string(lines[0])))
-	if err != nil {
-		return 0, fmt.Errorf("pdfsigning: invalid startxref: %w", err)
+	value, end, ok := parseLeadingInt(input, pos)
+	if !ok || (end < len(input) && !isPDFWhitespace(input[end]) && input[end] != '%') {
+		return 0, errors.New("pdfsigning: invalid startxref")
 	}
 	return value, nil
+}
+
+func isPDFWhitespace(b byte) bool {
+	switch b {
+	case 0, '\t', '\n', '\f', '\r', ' ':
+		return true
+	default:
+		return false
+	}
 }
 
 func parseTrailerContext(ctx context.Context, trailer []byte, maxXrefEntries, reservedObjects int) (int, pdfRef, error) {
@@ -237,6 +325,10 @@ func parseTrailerContext(ctx context.Context, trailer []byte, maxXrefEntries, re
 }
 
 func parsePrevXrefContext(ctx context.Context, trailer []byte) (int, bool, error) {
+	return parseTrailerOffsetContext(ctx, trailer, "/Prev")
+}
+
+func parseTrailerOffsetContext(ctx context.Context, trailer []byte, key string) (int, bool, error) {
 	if err := signContextErr(ctx); err != nil {
 		return 0, false, err
 	}
@@ -244,18 +336,18 @@ func parsePrevXrefContext(ctx context.Context, trailer []byte) (int, bool, error
 	if err != nil {
 		return 0, false, err
 	}
-	prevValue, ok, err := trailerEntryValueContext(ctx, dict, "/Prev")
+	value, ok, err := trailerEntryValueContext(ctx, dict, key)
 	if err != nil {
 		return 0, false, err
 	}
 	if !ok {
 		return 0, false, nil
 	}
-	prev, ok := parseExactNonnegativeInt(prevValue)
+	offset, ok := parseExactNonnegativeInt(value)
 	if !ok {
-		return 0, false, errors.New("pdfsigning: invalid trailer /Prev")
+		return 0, false, fmt.Errorf("pdfsigning: invalid trailer %s", key)
 	}
-	return prev, true, nil
+	return offset, true, nil
 }
 
 func parseExactNonnegativeInt(value []byte) (int, bool) {
@@ -501,25 +593,31 @@ func xrefTrailerContext(ctx context.Context, input []byte, offset int) ([]byte, 
 	if offset < 0 || offset >= len(input) {
 		return nil, errors.New("pdfsigning: xref offset outside PDF")
 	}
-	if !bytes.HasPrefix(input[offset:], []byte("xref")) {
-		return nil, fmt.Errorf("%w: only classic xref tables are supported", ErrUnsupportedPDF)
+	if !isClassicXrefAt(input, offset) {
+		// A cross-reference stream's dictionary is also its trailer.
+		_, dict, _, err := objectDictionaryAtContext(ctx, input, offset)
+		if err != nil {
+			return nil, fmt.Errorf("%w: xref offset is neither an xref table nor an xref stream: %w", ErrUnsupportedPDF, err)
+		}
+		return dict, nil
 	}
 	for pos := offset + len("xref"); pos < len(input); {
 		if err := signContextErr(ctx); err != nil {
 			return nil, err
 		}
 		line, next := nextPDFLine(input, pos)
+		if isXrefTrailerLine(line) {
+			return trailerDictionaryContext(ctx, input[pos:])
+		}
 		pos = next
-		if !bytes.Equal(bytes.TrimSpace(line), []byte("trailer")) {
-			continue
-		}
-		dict, err := trailerDictionaryContext(ctx, input[pos:])
-		if err != nil {
-			return nil, err
-		}
-		return dict, nil
 	}
 	return nil, errors.New("pdfsigning: xref trailer not found")
+}
+
+// isXrefTrailerLine reports whether line starts with the trailer keyword,
+// which may share its line with the dictionary ("trailer <<").
+func isXrefTrailerLine(line []byte) bool {
+	return hasPDFKeywordAt(line, skipPDFSpaces(line, 0), "trailer")
 }
 
 func findByteContext(ctx context.Context, input []byte, needle byte) (int, error) {
@@ -563,7 +661,7 @@ func (resolver *pdfXrefResolver) loadXrefTableContext(ctx context.Context, input
 		if len(line) == 0 {
 			continue
 		}
-		if bytes.Equal(line, []byte("trailer")) {
+		if isXrefTrailerLine(line) {
 			return maximum, nil
 		}
 		first, nextInt, ok := parseLeadingInt(line, 0)
@@ -628,7 +726,7 @@ func parseXrefTableContext(ctx context.Context, input []byte, offset, maxXrefEnt
 		if len(line) == 0 {
 			continue
 		}
-		if bytes.Equal(line, []byte("trailer")) {
+		if isXrefTrailerLine(line) {
 			break
 		}
 		first, nextInt, ok := parseLeadingInt(line, 0)
@@ -698,13 +796,17 @@ func parseXrefEntry(entry []byte) (int, int, byte, bool) {
 	return offset, generation, entry[statusPos], true
 }
 
+// nextPDFLine returns the line at pos and the start of the next one. CR, LF
+// and CRLF each end a line.
 func nextPDFLine(input []byte, pos int) ([]byte, int) {
 	start := pos
-	for pos < len(input) && input[pos] != '\n' {
+	for pos < len(input) && input[pos] != '\n' && input[pos] != '\r' {
 		pos++
 	}
 	line := input[start:pos]
-	if pos < len(input) {
+	if pos+1 < len(input) && input[pos] == '\r' && input[pos+1] == '\n' {
+		pos += 2
+	} else if pos < len(input) {
 		pos++
 	}
 	return line, pos

@@ -146,10 +146,21 @@ func ExtractSignature(input []byte) (*PDFSignatureContents, error) {
 // SignatureCount returns the number of supported signature values reachable
 // through the current catalog's AcroForm field tree. Names in strings,
 // comments, stream data, unrelated dictionaries, and unreferenced objects are
-// ignored.
+// ignored. A PDF the parser cannot read also counts as 0; use CountSignatures
+// to tell that apart from an unsigned PDF.
 func SignatureCount(input []byte) int {
-	signatures, _ := scanSignatureDictionaries(input)
-	return len(signatures)
+	count, _ := CountSignatures(input)
+	return count
+}
+
+// CountSignatures is SignatureCount that reports why a PDF could not be
+// parsed instead of counting it as unsigned.
+func CountSignatures(input []byte) (int, error) {
+	signatures, err := scanSignatureDictionaries(input)
+	if err != nil {
+		return 0, err
+	}
+	return len(signatures), nil
 }
 
 // ByteRangeFromInts converts a parsed ByteRange into a fixed int64 tuple.
@@ -427,18 +438,14 @@ func reachableSignatureDictionaryStarts(ctx context.Context, input []byte) (map[
 	if err != nil {
 		return nil, err
 	}
-	resolver, err := newPDFXrefResolverContext(ctx, input, xrefOffset, DefaultMaxXrefChainLength, DefaultMaxXrefEntries)
+	resolver, err := newPDFReadXrefResolverContext(ctx, input, xrefOffset, DefaultMaxXrefChainLength, DefaultMaxXrefEntries)
 	if err != nil {
 		return nil, err
 	}
 	if size <= resolver.maxObject {
 		return nil, fmt.Errorf("%w: trailer /Size %d does not cover xref object %d", ErrUnsupportedPDF, size, resolver.maxObject)
 	}
-	rootOffset, err := resolver.objectOffsetContext(ctx, root)
-	if err != nil {
-		return nil, err
-	}
-	rootDict, rootStart, err := readObjectDictPositionContext(ctx, input, root, rootOffset)
+	rootDict, rootStart, err := resolver.objectDictionaryContext(ctx, root)
 	if err != nil {
 		return nil, err
 	}
@@ -495,11 +502,7 @@ func reachableSignatureDictionaryStarts(ctx context.Context, input []byte) (map[
 	for len(queue) > 0 {
 		field := queue[0]
 		queue = queue[1:]
-		offset, err := resolver.objectOffsetContext(ctx, field.ref)
-		if err != nil {
-			return nil, err
-		}
-		dict, dictStart, err := readObjectDictPositionContext(ctx, input, field.ref, offset)
+		dict, dictStart, err := resolver.objectDictionaryContext(ctx, field.ref)
 		if err != nil {
 			return nil, err
 		}
@@ -554,6 +557,11 @@ func reachableSignatureDictionaryStarts(ctx context.Context, input []byte) (map[
 			_, signatureStart, signed, err := resolveOptionalDictionaryEntry(ctx, resolver, value.owner, value.ownerStart, value.entry)
 			if err != nil {
 				return nil, fmt.Errorf("%w: invalid signature field /V: %w", ErrUnsupportedPDF, err)
+			}
+			if signed && signatureStart < 0 {
+				// ByteRange and /Contents are file offsets, so the signature
+				// dictionary itself must not be inside an object stream.
+				return nil, fmt.Errorf("%w: signature dictionary is stored in an object stream", ErrUnsupportedPDF)
 			}
 			if signed {
 				reachable[signatureStart] = struct{}{}
@@ -648,6 +656,9 @@ func resolveOptionalDictionaryEntry(ctx context.Context, resolver *pdfXrefResolv
 		return nil, 0, false, nil
 	}
 	if pos+1 < len(value) && value[pos] == '<' && value[pos+1] == '<' {
+		if ownerStart < 0 {
+			return value[pos:], -1, true, nil
+		}
 		return value[pos:], ownerStart + entry.ValueStart + pos, true, nil
 	}
 	ref, ok := parseReferenceValue(value)
@@ -664,6 +675,9 @@ func resolveOptionalDictionaryEntry(ctx context.Context, resolver *pdfXrefResolv
 	}
 	if indirectPos+1 >= len(indirect) || indirect[indirectPos] != '<' || indirect[indirectPos+1] != '<' {
 		return nil, 0, false, errors.New("indirect value is neither null nor a dictionary")
+	}
+	if start < 0 {
+		return indirect[indirectPos:], -1, true, nil
 	}
 	return indirect[indirectPos:], start + indirectPos, true, nil
 }
@@ -698,6 +712,8 @@ func resolveOptionalReferenceArrayEntry(ctx context.Context, resolver *pdfXrefRe
 	return refs, true, err
 }
 
+// indirectValueContext returns the value of ref and its offset in the PDF,
+// or -1 as the offset for an object stored in an object stream.
 func (resolver *pdfXrefResolver) indirectValueContext(ctx context.Context, ref pdfRef) ([]byte, int, error) {
 	if resolver == nil {
 		return nil, 0, errors.New("pdfsigning: xref resolver not initialized")
@@ -708,11 +724,17 @@ func (resolver *pdfXrefResolver) indirectValueContext(ctx context.Context, ref p
 	if cached, ok := resolver.indirectValues[ref]; ok {
 		return cached.data, cached.start, nil
 	}
-	offset, err := resolver.objectOffsetContext(ctx, ref)
+	entry, err := resolver.objectEntryContext(ctx, ref)
 	if err != nil {
 		return nil, 0, err
 	}
-	data, start, err := readIndirectValuePositionContext(ctx, resolver.input, ref, offset)
+	var data []byte
+	start := -1
+	if entry.Compressed {
+		data, err = resolver.compressedValueContext(ctx, ref, entry)
+	} else {
+		data, start, err = readIndirectValuePositionContext(ctx, resolver.input, ref, entry.Offset)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -721,6 +743,19 @@ func (resolver *pdfXrefResolver) indirectValueContext(ctx context.Context, ref p
 	}
 	resolver.indirectValues[ref] = cachedIndirectValue{data: data, start: start}
 	return data, start, nil
+}
+
+// objectDictionaryContext returns the dictionary object ref and its offset in
+// the PDF (-1 when it is stored in an object stream).
+func (resolver *pdfXrefResolver) objectDictionaryContext(ctx context.Context, ref pdfRef) ([]byte, int, error) {
+	value, start, err := resolver.indirectValueContext(ctx, ref)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(value) < 2 || value[0] != '<' || value[1] != '<' {
+		return nil, 0, errors.New("pdfsigning: object dictionary not found")
+	}
+	return value, start, nil
 }
 
 func parseReferenceArray(value []byte) ([]pdfRef, error) {

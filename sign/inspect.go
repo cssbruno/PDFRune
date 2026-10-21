@@ -129,7 +129,7 @@ func inspectSignedData(signedDataValue derValue) (*CMSInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	issuer, serial, err := decodeIssuerAndSerial(signerChildren[1])
+	signer, err := findSignerCertificate(certificates, signerChildren[1])
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func inspectSignedData(signedDataValue derValue) (*CMSInfo, error) {
 
 	return &CMSInfo{
 		Certificates:     append([]*x509.Certificate(nil), certificates...),
-		Signer:           findSignerCertificate(certificates, issuer, serial),
+		Signer:           signer,
 		SignedAttributes: signedAttrs,
 	}, nil
 }

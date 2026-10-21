@@ -11,13 +11,16 @@ import (
 
 // inlinedStreamParameterKeys may hold an indirect reference in producer
 // output, but reconstruction accepts only direct values for them so a decoding
-// parameter cannot be shared with, or changed through, another object.
+// parameter cannot be shared with, or changed through, another object. A
+// direct /Length also lets the stream check repair a missing end-of-line
+// marker before endstream.
 var inlinedStreamParameterKeys = map[string]bool{
 	"DecodeParms": true,
 	"Filter":      true,
+	"Length":      true,
 }
 
-// inlineStreamParameterRefs replaces a top-level /Filter or /DecodeParms
+// inlineStreamParameterRefs replaces a top-level /Filter, /DecodeParms or /Length
 // indirect reference with the referenced object's value when that value is a
 // plain direct value: not a stream and without references of its own. Any
 // other input is returned unchanged, and the sanitizer then rejects what it

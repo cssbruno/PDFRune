@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -37,17 +38,20 @@ var removedPDFKeys = map[string]bool{
 	"Metadata":      true,
 	"Movie":         true,
 	"Names":         true,
-	"OpenAction":    true,
-	"Perms":         true,
-	"PieceInfo":     true,
-	"Rendition":     true,
-	"RichMedia":     true,
-	"Screen":        true,
-	"Sound":         true,
-	"SubmitForm":    true,
-	"Threads":       true,
-	"URI":           true,
-	"XFA":           true,
+	// An OPI proxy names an external high-resolution file; the proxy image
+	// or form itself is kept and renders without it.
+	"OPI":        true,
+	"OpenAction": true,
+	"Perms":      true,
+	"PieceInfo":  true,
+	"Rendition":  true,
+	"RichMedia":  true,
+	"Screen":     true,
+	"Sound":      true,
+	"SubmitForm": true,
+	"Threads":    true,
+	"URI":        true,
+	"XFA":        true,
 }
 
 var removedActionNames = map[string]bool{
@@ -103,6 +107,9 @@ type pdfValueScanner struct {
 	normalRefCounts  map[refKey]int
 	rootLength       []byte
 	rootLengthSeen   bool
+	// nameMapBudget bounds the bytes read by name-map shape checks.
+	nameMapBudget    int
+	nameMapBudgetSet bool
 }
 
 type sanitizedPDFObject struct {
@@ -255,7 +262,18 @@ func (s *pdfValueScanner) sanitizeDict(preserveKeys bool) ([]byte, int, bool, er
 		// Once a dictionary is known to contain producer-chosen resource names,
 		// none of those names are structural even if one happens to be /Font,
 		// /XObject, or another resource-category spelling.
-		preserveChildKeys := !preserveKeys && resourceNameDictionaryKeys[key]
+		if !preserveKeys && removedPDFKeys[key] && !rejectedExternalKeys[key] {
+			// A removed entry never reaches the output, so its value is only
+			// stepped over: what it would be refused for (an OPI proxy's
+			// external file) does not refuse the whole document. A key that
+			// itself makes a stream external is still refused below.
+			unbounded := math.MaxInt
+			if err := s.skipValue(0, &unbounded, s.pos); err != nil {
+				return nil, s.pos, false, fmt.Errorf("PDF dictionary key /%s: %w", key, err)
+			}
+			continue
+		}
+		preserveChildKeys := !preserveKeys && resourceNameDictionaryKeys[key] && s.valueMayBeNameMap()
 		value, _, valueDrop, err := s.sanitizeValueWithDictionaryKeys(preserveChildKeys)
 		if err != nil {
 			return nil, s.pos, false, fmt.Errorf("PDF dictionary key /%s: %w", key, err)
@@ -284,13 +302,14 @@ func (s *pdfValueScanner) sanitizeDict(preserveKeys bool) ([]byte, int, bool, er
 		if !preserveKeys && rejectedExternalKeys[key] {
 			return nil, s.pos, false, fmt.Errorf("disallowed PDF external resource key /%s", key)
 		}
-		if !preserveKeys && key == "Subtype" {
+		// /Subtype2 /PS marks a PostScript form XObject in PDF 1.3 and later.
+		if !preserveKeys && (key == "Subtype" || key == "Subtype2") {
 			if _, indirect := singleIndirectRefKey(value); indirect {
-				return nil, s.pos, false, errors.New("indirect PDF /Subtype values are not allowed")
+				return nil, s.pos, false, fmt.Errorf("indirect PDF /%s values are not allowed", key)
 			}
 			postScript, err := pdfValueIsName(s.data, valueStart, map[string]bool{"PS": true})
 			if err != nil {
-				return nil, s.pos, false, fmt.Errorf("PDF dictionary key /Subtype: %w", err)
+				return nil, s.pos, false, fmt.Errorf("PDF dictionary key /%s: %w", key, err)
 			}
 			if postScript {
 				return nil, s.pos, false, errors.New("disallowed PostScript XObject")
@@ -328,6 +347,22 @@ func (s *pdfValueScanner) sanitizeDict(preserveKeys bool) ([]byte, int, bool, er
 		out.WriteByte(' ')
 		out.Write(value)
 	}
+}
+
+// valueMayBeNameMap reports whether the value at s.pos, reached through a
+// resource category key, may be a resource-name map. A direct dictionary must
+// have the shape of one; a reference is checked by the reconstruction when the
+// object it names is read.
+func (s *pdfValueScanner) valueMayBeNameMap() bool {
+	probe := &pdfValueScanner{data: s.data, pos: s.pos}
+	probe.skipSpace()
+	if !probe.has("<<") {
+		return true
+	}
+	if !s.nameMapBudgetSet {
+		s.nameMapBudget, s.nameMapBudgetSet = nameMapCheckBudget(s.data), true
+	}
+	return looksLikeResourceNameMap(s.data, probe.pos, &s.nameMapBudget)
 }
 
 func (s *pdfValueScanner) sanitizeArray() ([]byte, int, bool, error) {

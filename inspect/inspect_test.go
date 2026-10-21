@@ -331,15 +331,21 @@ func TestDecodedStreamsOnlyDecodesAnExactSingleFlateFilter(t *testing.T) {
 	}
 }
 
-func TestDecodedStreamsRejectsLengthThatDoesNotReachEndstream(t *testing.T) {
+func TestDecodedStreamsReadsMeasuredLengthWhenLengthDoesNotReachEndstream(t *testing.T) {
 	data := inspectPDFWithBodies([]string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
 		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R >>",
 		"<< /Length 2 >>\nstream\nabc\nendstream",
 	})
-	if _, err := DecodedStreams(data); err == nil || !strings.Contains(err.Error(), "endstream") {
-		t.Fatalf("DecodedStreams() error = %v, want explicit invalid endstream error", err)
+	// importpdf repairs a /Length that does not reach endstream by measuring
+	// the stream, as conforming readers do.
+	streams, err := DecodedStreams(data)
+	if err != nil {
+		t.Fatalf("DecodedStreams() error = %v", err)
+	}
+	if len(streams) != 1 || string(streams[0]) != "abc" {
+		t.Fatalf("DecodedStreams() = %q, want the stream read with its measured length", streams)
 	}
 }
 

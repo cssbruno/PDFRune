@@ -138,7 +138,9 @@ func TestOpenBytesRejectsOversizedStartXref(t *testing.T) {
 	}
 }
 
-func TestOpenBytesRejectsCyclicIndirectStreamLength(t *testing.T) {
+// A /Length that resolves through a cycle is unusable, so the stream is
+// measured up to endstream; the cycle guard still stops the resolution.
+func TestOpenBytesMeasuresStreamWithCyclicIndirectLength(t *testing.T) {
 	tests := map[string][]string{
 		"self": {
 			"<< /Type /Catalog /Pages 2 0 R /Length 1 0 R >>\nstream\n\nendstream",
@@ -156,15 +158,20 @@ func TestOpenBytesRejectsCyclicIndirectStreamLength(t *testing.T) {
 	}
 	for name, objects := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := OpenBytes(buildSecurityPDF(t, objects))
-			if err == nil || !strings.Contains(err.Error(), "resolution contains a cycle") {
-				t.Fatalf("OpenBytes() error = %v, want indirect object cycle", err)
+			source, err := OpenBytes(buildSecurityPDF(t, objects))
+			if err != nil {
+				t.Fatalf("OpenBytes() error = %v", err)
+			}
+			if _, err := source.Page(1, "MediaBox"); err != nil {
+				t.Fatalf("Page() error = %v", err)
 			}
 		})
 	}
 }
 
-func TestOpenBytesRejectsMissingOrOutOfBoundsStreamLength(t *testing.T) {
+// A stream whose /Length is missing, out of bounds or not a number is measured
+// up to endstream, and its body is rewritten with the measured length.
+func TestPageMeasuresStreamWithoutUsableLength(t *testing.T) {
 	for name, stream := range map[string]string{
 		"missing":       "<<>>\nstream\n\nendstream",
 		"out-of-bounds": "<< /Length 100 >>\nstream\n\nendstream",
@@ -180,11 +187,15 @@ func TestOpenBytesRejectsMissingOrOutOfBoundsStreamLength(t *testing.T) {
 			for opener, open := range sourceOpeners(data) {
 				t.Run(opener, func(t *testing.T) {
 					source, err := open()
-					if err == nil {
-						_, err = source.Page(1, "MediaBox")
+					if err != nil {
+						t.Fatalf("open: %v", err)
 					}
-					if err == nil {
-						t.Fatal("page import accepted a stream without a valid in-bounds Length")
+					page, err := source.Page(1, "MediaBox")
+					if err != nil {
+						t.Fatalf("Page() error = %v", err)
+					}
+					if content, err := page.ContentWithError(); err != nil || len(bytes.TrimSpace(content)) == 0 {
+						t.Fatalf("content = %q, %v; want the empty stream wrapped", content, err)
 					}
 				})
 			}
@@ -231,7 +242,9 @@ func TestOpenBytesAcceptsValidIndirectStreamLength(t *testing.T) {
 	}
 }
 
-func TestOpenBytesRejectsExcessiveIndirectStreamLengthDepth(t *testing.T) {
+// A chain of indirect lengths deeper than the resolution limit stops at that
+// limit; each stream past it is measured instead of followed further.
+func TestOpenBytesBoundsIndirectStreamLengthDepth(t *testing.T) {
 	objects := []string{
 		"<< /Type /Catalog /Pages 2 0 R /Length 5 0 R >>\nstream\n\nendstream",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -242,9 +255,8 @@ func TestOpenBytesRejectsExcessiveIndirectStreamLengthDepth(t *testing.T) {
 		objects = append(objects, fmt.Sprintf("<< /Length %d 0 R >>\nstream\n\nendstream", objectNumber+1))
 	}
 	objects = append(objects, "0")
-	_, err := OpenBytes(buildSecurityPDF(t, objects))
-	if err == nil || !strings.Contains(err.Error(), "resolution exceeds maximum depth") {
-		t.Fatalf("OpenBytes() error = %v, want indirect object depth limit", err)
+	if _, err := OpenBytes(buildSecurityPDF(t, objects)); err != nil {
+		t.Fatalf("OpenBytes() error = %v", err)
 	}
 }
 

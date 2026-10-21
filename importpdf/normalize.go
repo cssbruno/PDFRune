@@ -93,14 +93,19 @@ func (n *pdfNormalizer) collectXrefChain(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	type xrefSection struct {
+		offset int
+		hidden bool // reached through a hybrid file's /XRefStm
+	}
 	seen := make(map[int]bool)
-	pending := []int{start}
+	pending := []xrefSection{{offset: start}}
 	for len(pending) > 0 {
 		if err := importContextErr(ctx); err != nil {
 			return err
 		}
-		offset := pending[0]
+		section := pending[0]
 		pending = pending[1:]
+		offset := section.offset
 		if offset <= 0 {
 			continue
 		}
@@ -127,9 +132,14 @@ func (n *pdfNormalizer) collectXrefChain(ctx context.Context) error {
 		if n.trailer == nil {
 			n.trailer = trailer
 		}
+		// The stream a hybrid table points to only adds entries to that table:
+		// its own /Prev repeats the table's and is ignored, as readers do.
+		if section.hidden {
+			continue
+		}
 		// A hybrid file's XRefStm section is read after its classic table and
 		// before Prev, so entries the table already defined keep precedence.
-		next := make([]int, 0, 2)
+		next := make([]xrefSection, 0, 2)
 		for _, key := range []string{"XRefStm", "Prev"} {
 			value, ok := trailer[key]
 			if !ok {
@@ -139,7 +149,7 @@ func (n *pdfNormalizer) collectXrefChain(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("invalid PDF trailer %s offset: %w", key, err)
 			}
-			next = append(next, target)
+			next = append(next, xrefSection{offset: target, hidden: key == "XRefStm"})
 		}
 		pending = append(next, pending...)
 	}
@@ -154,7 +164,7 @@ func (n *pdfNormalizer) parseXrefStream(ctx context.Context, offset int) (pdfDic
 	if !ok {
 		return nil, errors.New("PDF xref offset does not point to an xref table or stream")
 	}
-	body, found, err := n.doc.objectBodyFromBytesContext(ctx, ref, n.doc.data[offset:])
+	body, found, err := n.doc.objectBodyFromBytesContext(ctx, ref, n.doc.data[offset:], true)
 	if err != nil {
 		return nil, err
 	}
@@ -357,52 +367,86 @@ func (n *pdfNormalizer) unpackObjectStreams(ctx context.Context, security *pdfSe
 				return err
 			}
 		}
-		decoded, err := n.decodeContainer(ctx, dict, raw)
+		numbers, bodies, err := n.splitObjectStreamContext(ctx, streamNumber, dict, raw)
 		if err != nil {
-			return fmt.Errorf("invalid PDF object stream %d: %w", streamNumber, err)
-		}
-		count, err := optionalPDFInt(dict, "N", -1)
-		if err != nil || count < 0 || count > MaxXrefEntries {
-			return fmt.Errorf("PDF object stream %d has an invalid N", streamNumber)
-		}
-		first, err := optionalPDFInt(dict, "First", -1)
-		if err != nil || first < 0 || first > len(decoded) {
-			return fmt.Errorf("PDF object stream %d has an invalid First", streamNumber)
-		}
-		numbers := make([]int, count)
-		offsets := make([]int, count)
-		pos := 0
-		for i := 0; i < count; i++ {
-			pos = skipPDFSpace(decoded[:first], pos)
-			number, _, next, ok := readPDFIntToken(decoded[:first], pos)
-			if !ok || number < 0 {
-				return fmt.Errorf("PDF object stream %d has an invalid header", streamNumber)
-			}
-			pos = skipPDFSpace(decoded[:first], next)
-			offset, _, next, ok := readPDFIntToken(decoded[:first], pos)
-			if !ok || offset < 0 || first+offset > len(decoded) || (i > 0 && offset < offsets[i-1]) {
-				return fmt.Errorf("PDF object stream %d has an invalid header", streamNumber)
-			}
-			pos = next
-			numbers[i], offsets[i] = number, offset
+			return err
 		}
 		for _, objectNumber := range streams[streamNumber] {
 			index := n.packed[objectNumber].index
-			if index < 0 || index >= count || numbers[index] != objectNumber {
+			if index < 0 || index >= len(numbers) || numbers[index] != objectNumber {
 				// A stale xref entry naming a slot that no longer holds the
 				// object resolves to null, as in conforming readers.
 				delete(n.packed, objectNumber)
 				continue
 			}
-			end := len(decoded)
-			if index+1 < count {
-				end = first + offsets[index+1]
-			}
-			body := bytes.TrimSpace(decoded[first+offsets[index] : end])
-			n.doc.cache[ObjRef{num: objectNumber}] = append([]byte{}, body...)
+			n.doc.cache[ObjRef{num: objectNumber}] = bodies[index]
 		}
 	}
 	return nil
+}
+
+// splitObjectStreamContext decodes an object stream whose data is already
+// decrypted and returns the object number and body held in each slot.
+func (n *pdfNormalizer) splitObjectStreamContext(ctx context.Context, streamNumber int, dict pdfDict, raw []byte) ([]int, [][]byte, error) {
+	decoded, err := n.decodeContainer(ctx, dict, raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid PDF object stream %d: %w", streamNumber, err)
+	}
+	count, err := optionalPDFInt(dict, "N", -1)
+	if err != nil || count < 0 || count > MaxXrefEntries {
+		return nil, nil, fmt.Errorf("PDF object stream %d has an invalid N", streamNumber)
+	}
+	first, err := optionalPDFInt(dict, "First", -1)
+	if err != nil || first < 0 || first > len(decoded) {
+		return nil, nil, fmt.Errorf("PDF object stream %d has an invalid First", streamNumber)
+	}
+	numbers := make([]int, count)
+	offsets := make([]int, count)
+	pos := 0
+	for i := 0; i < count; i++ {
+		pos = skipPDFSpace(decoded[:first], pos)
+		number, _, next, ok := readPDFIntToken(decoded[:first], pos)
+		if !ok || number < 0 {
+			return nil, nil, fmt.Errorf("PDF object stream %d has an invalid header", streamNumber)
+		}
+		pos = skipPDFSpace(decoded[:first], next)
+		offset, _, next, ok := readPDFIntToken(decoded[:first], pos)
+		if !ok || offset < 0 || first+offset > len(decoded) || (i > 0 && offset < offsets[i-1]) {
+			return nil, nil, fmt.Errorf("PDF object stream %d has an invalid header", streamNumber)
+		}
+		pos = next
+		numbers[i], offsets[i] = number, offset
+	}
+	bodies := make([][]byte, count)
+	for i := range numbers {
+		end := len(decoded)
+		if i+1 < count {
+			end = first + offsets[i+1]
+		}
+		bodies[i] = bytes.TrimSpace(decoded[first+offsets[i] : end])
+	}
+	return numbers, bodies, nil
+}
+
+// objectStreamMembersContext splits the unencrypted object stream ref, whose
+// object body is body, into its members by object number; the first slot that
+// holds a number wins.
+func (n *pdfNormalizer) objectStreamMembersContext(ctx context.Context, ref ObjRef, body []byte) (map[int][]byte, error) {
+	dict, raw, err := n.doc.parseStreamContext(ctx, body)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PDF object stream %d: %w", ref.num, err)
+	}
+	numbers, bodies, err := n.splitObjectStreamContext(ctx, ref.num, dict, raw)
+	if err != nil {
+		return nil, err
+	}
+	members := make(map[int][]byte, len(numbers))
+	for i, number := range numbers {
+		if _, ok := members[number]; !ok {
+			members[number] = bodies[i]
+		}
+	}
+	return members, nil
 }
 
 func (n *pdfNormalizer) write(ctx context.Context, security *pdfSecurityHandler, maxBytes int64) ([]byte, error) {
@@ -431,7 +475,13 @@ func (n *pdfNormalizer) write(ctx context.Context, security *pdfSecurityHandler,
 		_, packed := n.packed[ref.num]
 		body, err := n.doc.objectBodyContext(ctx, ref)
 		if err != nil {
-			return nil, err
+			if ctxErr := importContextErr(ctx); ctxErr != nil {
+				return nil, ctxErr
+			}
+			// An entry that does not lead to its object is left out, so a
+			// reference to it reads as missing, as in the classic parser, which
+			// only fails when something actually needs that object.
+			continue
 		}
 		if security != nil && !packed {
 			if body, err = n.decryptObject(ctx, security, ref, body); err != nil {

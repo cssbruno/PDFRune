@@ -24,6 +24,7 @@ var (
 	oidContentType     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
 	oidMessageDigest   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
 	oidSigningTime     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
+	oidSigningCertV2   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 47}
 	oidSHA1            = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
 	oidSHA256          = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	oidSHA384          = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
@@ -32,6 +33,8 @@ var (
 	oidSHA256WithRSA   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}
 	oidSHA384WithRSA   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 12}
 	oidSHA512WithRSA   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 13}
+	oidRSASSAPSS       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 10}
+	oidMGF1            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
 	oidECDSAWithSHA256 = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}
 	oidECDSAWithSHA384 = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 3}
 	oidECDSAWithSHA512 = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 4}
@@ -87,7 +90,11 @@ func CreateCMS(content []byte, options CMSOptions) ([]byte, error) {
 		return nil, err
 	}
 	contentDigest := hashBytes(digest, content)
-	return createCMSWithDigest(content, contentDigest, digest, signingTime, options)
+	signedAttrs, err := signedAttributes(contentDigest, signingTime)
+	if err != nil {
+		return nil, err
+	}
+	return createCMSWithDigest(content, signedAttrs, digest, options)
 }
 
 func createDetachedCMSWithPreparedDigest(contentDigest []byte, options preparedOptions) ([]byte, error) {
@@ -102,7 +109,20 @@ func createDetachedCMSWithPreparedDigest(contentDigest []byte, options preparedO
 		Detached:         true,
 		SigningTime:      options.SigningTime,
 	}
-	return createCMSWithDigest(nil, contentDigest, options.DigestAlgorithm, options.SigningTime, cmsOptions)
+	// PAdES baseline (ETSI EN 319 142-1) forbids the CMS signing-time
+	// attribute, takes the time from /M instead, and requires the ESS
+	// signing-certificate-v2 attribute binding the signer certificate.
+	var signedAttrs []byte
+	var err error
+	if options.SubFilter == SubFilterETSI_CAdESDetached {
+		signedAttrs, err = cadesSignedAttributes(contentDigest, options.Certificate)
+	} else {
+		signedAttrs, err = signedAttributes(contentDigest, options.SigningTime)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return createCMSWithDigest(nil, signedAttrs, options.DigestAlgorithm, cmsOptions)
 }
 
 func prepareCMSOptions(options CMSOptions) (crypto.Hash, time.Time, error) {
@@ -126,17 +146,13 @@ func prepareCMSOptions(options CMSOptions) (crypto.Hash, time.Time, error) {
 	return digest, signingTime, nil
 }
 
-func createCMSWithDigest(content, contentDigest []byte, digest crypto.Hash, signingTime time.Time, options CMSOptions) (out []byte, err error) {
+func createCMSWithDigest(content, signedAttrs []byte, digest crypto.Hash, options CMSOptions) (out []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			out = nil
 			err = fmt.Errorf("pdfsigning: DER/CMS encoding failed: %v", recovered)
 		}
 	}()
-	signedAttrs, err := signedAttributes(contentDigest, signingTime)
-	if err != nil {
-		return nil, err
-	}
 	signatureDigest := hashBytes(digest, signedAttrs)
 	signature, err := options.Signer.Sign(rand.Reader, signatureDigest, digest)
 	if err != nil {
@@ -380,11 +396,10 @@ func verifySignerInfo(signerInfo derValue, certificates []*x509.Certificate, con
 	if len(children) < 6 {
 		return nil, errors.New("pdfsigning: incomplete SignerInfo")
 	}
-	issuer, serial, err := decodeIssuerAndSerial(children[1])
+	signer, err := findSignerCertificate(certificates, children[1])
 	if err != nil {
 		return nil, err
 	}
-	signer := findSignerCertificate(certificates, issuer, serial)
 	if signer == nil {
 		return nil, errors.New("pdfsigning: signer certificate not found")
 	}
@@ -405,7 +420,8 @@ func verifySignerInfo(signerInfo derValue, certificates []*x509.Certificate, con
 		return nil, errors.New("pdfsigning: CMS message digest mismatch")
 	}
 
-	if err := verifySignatureAlgorithm(children[4], signer.PublicKey, digest); err != nil {
+	pss, err := verifySignatureAlgorithm(children[4], signer.PublicKey, digest)
+	if err != nil {
 		return nil, err
 	}
 	signature := children[5]
@@ -413,7 +429,7 @@ func verifySignerInfo(signerInfo derValue, certificates []*x509.Certificate, con
 		return nil, err
 	}
 	signedAttrsDigest := hashBytes(digest, signedAttrsDER)
-	if err := verifyPublicKeySignature(signer.PublicKey, digest, signedAttrsDigest, signature.Content); err != nil {
+	if err := verifyPublicKeySignature(signer.PublicKey, digest, signedAttrsDigest, signature.Content, pss); err != nil {
 		return nil, err
 	}
 
@@ -461,6 +477,25 @@ func signedAttributes(messageDigest []byte, signingTime time.Time) ([]byte, erro
 	), nil
 }
 
+// cadesSignedAttributes builds PAdES-B-B signed attributes: contentType,
+// messageDigest and an ESS signing-certificate-v2 (RFC 5035) holding the
+// SHA-256 hash and issuer/serial of cert, without signing-time.
+func cadesSignedAttributes(messageDigest []byte, cert *x509.Certificate) ([]byte, error) {
+	certHash := hashBytes(crypto.SHA256, cert.Raw)
+	issuerSerial := derSequence(
+		derSequence(der(0xa4, cert.RawIssuer)),
+		derInteger(cert.SerialNumber),
+	)
+	// hashAlgorithm is omitted because SHA-256 is its DER default.
+	essCertID := derSequence(derOctetString(certHash), issuerSerial)
+	signingCertificate := derSequence(derSequence(essCertID))
+	return derSet(
+		derSequence(derOID(oidContentType), derSet(derOID(oidData))),
+		derSequence(derOID(oidMessageDigest), derSet(derOctetString(messageDigest))),
+		derSequence(derOID(oidSigningCertV2), derSet(signingCertificate)),
+	), nil
+}
+
 func decodeSignedAttributes(attrsDER []byte) ([]byte, *time.Time, error) {
 	attrs, rest, err := readDER(attrsDER)
 	if err != nil {
@@ -480,12 +515,9 @@ func decodeSignedAttributes(attrsDER []byte) ([]byte, *time.Time, error) {
 	contentTypeSeen := false
 	messageDigestSeen := false
 	var signingTime *time.Time
-	var previousAttr []byte
+	// The signature covers these exact bytes, so a non-canonical SET OF order
+	// is accepted here; CMS produced by this package is always DER sorted.
 	for _, attr := range children {
-		if previousAttr != nil && bytes.Compare(previousAttr, attr.Full) > 0 {
-			return nil, nil, errors.New("pdfsigning: signed attributes are not DER sorted")
-		}
-		previousAttr = attr.Full
 		attrChildren, err := readDERChildren(attr.Content)
 		if err != nil {
 			return nil, nil, err
@@ -580,62 +612,154 @@ func signatureAlgorithmID(publicKey any, digest crypto.Hash) ([]byte, error) {
 	return nil, fmt.Errorf("pdfsigning: unsupported signer public key %T", publicKey)
 }
 
-func verifySignatureAlgorithm(value derValue, publicKey any, digest crypto.Hash) error {
+// verifySignatureAlgorithm checks the SignerInfo signatureAlgorithm against
+// the signer key and digest. It returns non-nil options for RSASSA-PSS.
+func verifySignatureAlgorithm(value derValue, publicKey any, digest crypto.Hash) (*rsa.PSSOptions, error) {
 	children, err := readDERChildren(value.Content)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(children) == 0 {
-		return errors.New("pdfsigning: invalid signature algorithm")
+	if len(children) == 0 || len(children) > 2 {
+		return nil, errors.New("pdfsigning: invalid signature algorithm")
 	}
 	oid, err := decodeOID(children[0])
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if _, isRSA := publicKey.(*rsa.PublicKey); isRSA && oid.Equal(oidRSASSAPSS) {
+		if len(children) != 2 {
+			// Absent parameters mean SHA-1 (RFC 4055), which is rejected.
+			return nil, errors.New("pdfsigning: RSASSA-PSS parameters are required")
+		}
+		return decodePSSParameters(children[1], digest)
 	}
 	if len(children) > 1 && !isDERNull(children[1]) {
-		return errors.New("pdfsigning: unsupported signature algorithm parameters")
+		return nil, errors.New("pdfsigning: unsupported signature algorithm parameters")
 	}
 	switch publicKey.(type) {
 	case *rsa.PublicKey:
 		if oid.Equal(oidRSAEncryption) {
-			return nil
+			return nil, nil
 		}
 		switch digest {
 		case crypto.SHA256:
 			if oid.Equal(oidSHA256WithRSA) {
-				return nil
+				return nil, nil
 			}
 		case crypto.SHA384:
 			if oid.Equal(oidSHA384WithRSA) {
-				return nil
+				return nil, nil
 			}
 		case crypto.SHA512:
 			if oid.Equal(oidSHA512WithRSA) {
-				return nil
+				return nil, nil
 			}
 		}
 	case *ecdsa.PublicKey:
 		switch digest {
 		case crypto.SHA256:
 			if oid.Equal(oidECDSAWithSHA256) {
-				return nil
+				return nil, nil
 			}
 		case crypto.SHA384:
 			if oid.Equal(oidECDSAWithSHA384) {
-				return nil
+				return nil, nil
 			}
 		case crypto.SHA512:
 			if oid.Equal(oidECDSAWithSHA512) {
-				return nil
+				return nil, nil
 			}
 		}
 	}
-	return errors.New("pdfsigning: signature algorithm does not match signer key and digest")
+	return nil, errors.New("pdfsigning: signature algorithm does not match signer key and digest")
 }
 
-func verifyPublicKeySignature(publicKey any, digest crypto.Hash, hashed, signature []byte) error {
+// decodePSSParameters decodes RSASSA-PSS-params (RFC 4055 3.1). The hash and
+// the MGF1 hash must both equal digest; omitted fields take their SHA-1
+// defaults and are therefore rejected, except saltLength (default 20).
+func decodePSSParameters(value derValue, digest crypto.Hash) (*rsa.PSSOptions, error) {
+	if err := expectTag(value, 0x30, "RSASSA-PSS parameters"); err != nil {
+		return nil, err
+	}
+	fields, err := readDERChildren(value.Content)
+	if err != nil {
+		return nil, err
+	}
+	var hashSeen, mgfSeen bool
+	saltLength := 20
+	nextTag := byte(0xa0)
+	for _, field := range fields {
+		if field.Tag < nextTag || field.Tag > 0xa3 {
+			return nil, errors.New("pdfsigning: invalid RSASSA-PSS parameters")
+		}
+		nextTag = field.Tag + 1
+		inner, rest, err := readDER(field.Content)
+		if err != nil {
+			return nil, err
+		}
+		if len(rest) != 0 {
+			return nil, errors.New("pdfsigning: invalid RSASSA-PSS parameters")
+		}
+		switch field.Tag {
+		case 0xa0:
+			hash, err := decodeDigestAlgorithm(inner)
+			if err != nil {
+				return nil, err
+			}
+			if hash != digest {
+				return nil, errors.New("pdfsigning: RSASSA-PSS hash does not match digest algorithm")
+			}
+			hashSeen = true
+		case 0xa1:
+			mgf, err := readDERChildren(inner.Content)
+			if err != nil {
+				return nil, err
+			}
+			if inner.Tag != 0x30 || len(mgf) != 2 {
+				return nil, errors.New("pdfsigning: invalid RSASSA-PSS mask generation function")
+			}
+			mgfOID, err := decodeOID(mgf[0])
+			if err != nil {
+				return nil, err
+			}
+			if !mgfOID.Equal(oidMGF1) {
+				return nil, fmt.Errorf("pdfsigning: unsupported RSASSA-PSS mask generation function %v", mgfOID)
+			}
+			mgfHash, err := decodeDigestAlgorithm(mgf[1])
+			if err != nil {
+				return nil, err
+			}
+			if mgfHash != digest {
+				return nil, errors.New("pdfsigning: RSASSA-PSS MGF1 hash does not match digest algorithm")
+			}
+			mgfSeen = true
+		case 0xa2:
+			var salt int
+			// rsa.PSSOptions treats 0 as "auto-detect"; the signature is still
+			// verified under the signer key, only the salt length is not pinned.
+			if rest, err := asn1.Unmarshal(inner.Full, &salt); err != nil || len(rest) != 0 || salt < 0 {
+				return nil, errors.New("pdfsigning: invalid RSASSA-PSS salt length")
+			}
+			saltLength = salt
+		case 0xa3:
+			var trailer int
+			if rest, err := asn1.Unmarshal(inner.Full, &trailer); err != nil || len(rest) != 0 || trailer != 1 {
+				return nil, errors.New("pdfsigning: unsupported RSASSA-PSS trailer field")
+			}
+		}
+	}
+	if !hashSeen || !mgfSeen {
+		return nil, errors.New("pdfsigning: RSASSA-PSS with SHA-1 defaults is not supported")
+	}
+	return &rsa.PSSOptions{SaltLength: saltLength, Hash: digest}, nil
+}
+
+func verifyPublicKeySignature(publicKey any, digest crypto.Hash, hashed, signature []byte, pss *rsa.PSSOptions) error {
 	switch key := publicKey.(type) {
 	case *rsa.PublicKey:
+		if pss != nil {
+			return rsa.VerifyPSS(key, digest, hashed, signature, pss)
+		}
 		return rsa.VerifyPKCS1v15(key, digest, hashed, signature)
 	case *ecdsa.PublicKey:
 		if !ecdsa.VerifyASN1(key, hashed, signature) {
@@ -736,6 +860,36 @@ func validateDocumentSignerCertificate(cert *x509.Certificate) error {
 	return errors.New("pdfsigning: signer certificate is not allowed for document signing")
 }
 
+// findSignerCertificate returns the certificate named by a SignerInfo sid,
+// either issuerAndSerialNumber or [0] subjectKeyIdentifier (RFC 5652 5.3),
+// or nil when no embedded certificate matches.
+func findSignerCertificate(certs []*x509.Certificate, sid derValue) (*x509.Certificate, error) {
+	switch sid.Tag {
+	case 0x30:
+		issuer, serial, err := decodeIssuerAndSerial(sid)
+		if err != nil {
+			return nil, err
+		}
+		for _, cert := range certs {
+			if bytes.Equal(cert.RawIssuer, issuer) && cert.SerialNumber.Cmp(serial) == 0 {
+				return cert, nil
+			}
+		}
+	case 0x80:
+		if len(sid.Content) == 0 {
+			return nil, errors.New("pdfsigning: empty signer subjectKeyIdentifier")
+		}
+		for _, cert := range certs {
+			if bytes.Equal(cert.SubjectKeyId, sid.Content) {
+				return cert, nil
+			}
+		}
+	default:
+		return nil, fmt.Errorf("pdfsigning: unsupported signer identifier tag 0x%02x", sid.Tag)
+	}
+	return nil, nil
+}
+
 func decodeIssuerAndSerial(value derValue) ([]byte, *big.Int, error) {
 	children, err := readDERChildren(value.Content)
 	if err != nil {
@@ -749,13 +903,4 @@ func decodeIssuerAndSerial(value derValue) ([]byte, *big.Int, error) {
 		return nil, nil, err
 	}
 	return children[0].Full, serial, nil
-}
-
-func findSignerCertificate(certs []*x509.Certificate, issuer []byte, serial *big.Int) *x509.Certificate {
-	for _, cert := range certs {
-		if bytes.Equal(cert.RawIssuer, issuer) && cert.SerialNumber.Cmp(serial) == 0 {
-			return cert
-		}
-	}
-	return nil
 }

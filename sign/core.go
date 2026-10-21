@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -622,7 +623,15 @@ func writeFilePrivate(outputPath string, data []byte) error {
 	return syncOutputDirectory(dir)
 }
 
+// pdfString encodes a PDF text string. Printable ASCII keeps the literal
+// form; any other rune switches to UTF-16BE with a byte order mark (ISO
+// 32000-1 7.9.2.2), written as a hex string so no byte needs escaping.
 func pdfString(value string) string {
+	for _, r := range value {
+		if (r < 32 && r != '\n' && r != '\r' && r != '\t') || r > 126 {
+			return pdfUTF16String(value)
+		}
+	}
 	var buf strings.Builder
 	buf.WriteByte('(')
 	for _, r := range value {
@@ -637,15 +646,21 @@ func pdfString(value string) string {
 		case '\t':
 			buf.WriteString(`\t`)
 		default:
-			if r < 32 || r > 126 {
-				buf.WriteByte('?')
-			} else {
-				buf.WriteRune(r)
-			}
+			buf.WriteRune(r)
 		}
 	}
 	buf.WriteByte(')')
 	return buf.String()
+}
+
+func pdfUTF16String(value string) string {
+	units := utf16.Encode([]rune(value))
+	encoded := make([]byte, 2, 2+2*len(units))
+	encoded[0], encoded[1] = 0xfe, 0xff
+	for _, unit := range units {
+		encoded = append(encoded, byte(unit>>8), byte(unit))
+	}
+	return "<" + strings.ToUpper(hex.EncodeToString(encoded)) + ">"
 }
 
 func pdfDate(t time.Time) string {

@@ -403,6 +403,11 @@ type Source struct {
 	root        ObjRef
 	pages       []sourcePage
 	limits      ImportOptions
+	// recovered maps object headers found by scanning the file, built the
+	// first time an xref entry does not lead to its object; scanning marks
+	// that scan (or a reconstruction) in progress so it is not started again.
+	recovered map[ObjRef]int
+	scanning  bool
 }
 
 // ForEachObjectBorrowedContext calls fn for every in-use classic-xref object
@@ -547,11 +552,30 @@ func parseSourceWithOptionsContext(ctx context.Context, data []byte, options Imp
 	// When bytes were prepended to a finished file (a UTF-8 BOM, a web
 	// framework's preamble), its offsets count from the header, so a source
 	// that failed as given is read once more from there.
-	if header := pdfHeaderOffset(data); header > 0 {
+	header := pdfHeaderOffset(data)
+	if header > 0 {
 		shifted, shiftedErr := parseNormalizedSourceContext(ctx, data[header:], options)
 		if shiftedErr == nil || errors.Is(shiftedErr, ErrPasswordRequired) || errors.Is(shiftedErr, ErrIncorrectPassword) {
 			return shifted, shiftedErr
 		}
+	}
+	// Last, a file whose cross-reference information is damaged is rebuilt
+	// from its object headers, as conforming readers repair it. Only a file
+	// with a PDF header is repaired, and the original error is kept when that
+	// does not produce a readable file either.
+	if header < 0 || isTerminalImportError(err) {
+		return nil, err
+	}
+	rebuilt, rebuildErr := reconstructSourceContext(ctx, data[header:], options)
+	if rebuildErr != nil {
+		if ctxErr := importContextErr(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	doc, rebuiltErr := parseNormalizedSourceContext(ctx, rebuilt, options)
+	if rebuiltErr == nil || isTerminalImportError(rebuiltErr) {
+		return doc, rebuiltErr
 	}
 	return nil, err
 }
@@ -647,11 +671,11 @@ func parseClassicSourceContext(ctx context.Context, data []byte, options ImportO
 }
 
 // parseSourceReaderAtWithOptionsContext parses a classic-xref PDF lazily. A
-// source that needs normalization is read once into memory, bounded by the
-// already-checked size, and parsed through the byte path.
+// source that needs normalization or repair is read once into memory, bounded
+// by the already-checked size, and parsed through the byte path.
 func parseSourceReaderAtWithOptionsContext(ctx context.Context, r io.ReaderAt, size int64, options ImportOptions) (*Source, error) {
 	doc, err := parseClassicSourceReaderAtContext(ctx, r, size, options)
-	if !errors.Is(err, errNeedsNormalization) {
+	if err == nil || isTerminalImportError(err) {
 		return doc, err
 	}
 	data := make([]byte, size)
@@ -803,7 +827,7 @@ func (doc *Source) parseXrefAtContext(ctx context.Context, offset int) (pdfDict,
 			if err := importContextErr(ctx); err != nil {
 				return nil, 0, err
 			}
-			p = skipPDFLineBreaks(doc.data, p)
+			p = skipPDFSpace(doc.data, p)
 			entryOffset, _, next, ok := readPDFIntToken(doc.data, p)
 			if !ok || entryOffset < 0 {
 				return nil, 0, errors.New("invalid PDF xref entry")
@@ -927,7 +951,7 @@ func (doc *Source) parseReaderAtXrefAtContext(ctx context.Context, offset int) (
 			if err := importContextErr(ctx); err != nil {
 				return nil, 0, err
 			}
-			p = skipPDFLineBreaks(data, p)
+			p = skipPDFSpace(data, p)
 			entryOffset, _, next, ok := readPDFIntToken(data, p)
 			if !ok || entryOffset < 0 {
 				return nil, 0, errors.New("invalid PDF xref entry")
@@ -1040,10 +1064,26 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 		nextInherited.resources = resources
 	}
 	if rotate, ok := dict["Rotate"]; ok {
-		nextInherited.rotate = rotate
+		if nextInherited.rotate, err = doc.resolvePDFValueContext(ctx, rotate); err != nil {
+			return err
+		}
 	}
+	typeName := ""
+	if typ, ok := dict["Type"]; ok && typ.kind == pdfValueName {
+		typeName = typ.name
+	}
+	contents, hasContents := dict["Contents"]
+	isPage := typeName == "Page" || (typeName == "" && hasContents)
 	for _, name := range pdfPageBoxNames() {
+		// Only MediaBox and CropBox are inheritable; a bleed, trim or art box
+		// on an intermediate Pages node applies to no page.
+		if !isPage && name != "MediaBox" && name != "CropBox" {
+			continue
+		}
 		if box, ok := dict[name]; ok {
+			if box, err = doc.resolvePDFBoxContext(ctx, box); err != nil {
+				return err
+			}
 			if boxesCopied {
 				nextInherited.boxes[name] = box
 			} else {
@@ -1057,12 +1097,7 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 			}
 		}
 	}
-	typeName := ""
-	if typ, ok := dict["Type"]; ok && typ.kind == pdfValueName {
-		typeName = typ.name
-	}
-	contents, hasContents := dict["Contents"]
-	if typeName == "Page" || (typeName == "" && hasContents) {
+	if isPage {
 		if len(doc.pages) >= MaxPages {
 			return errors.New("PDF page count exceeds maximum size")
 		}
@@ -1080,6 +1115,11 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 		return nil
 	}
 	kids, ok := dict["Kids"]
+	if ok {
+		if kids, err = doc.resolvePDFValueContext(ctx, kids); err != nil {
+			return err
+		}
+	}
 	if !ok || kids.kind != pdfValueArray {
 		return fmt.Errorf("PDF page tree object %d %d R does not contain page kids", ref.num, ref.gen)
 	}
@@ -1096,6 +1136,61 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 		}
 	}
 	return nil
+}
+
+// resolvePDFValueContext follows a single indirect reference and returns the
+// direct value it names; a direct value is returned unchanged. Page tree
+// entries such as /Kids, /MediaBox and /Rotate may be indirect objects.
+func (doc *Source) resolvePDFValueContext(ctx context.Context, value pdfValue) (pdfValue, error) {
+	ref, ok := pdfValueAsRef(value)
+	if !ok {
+		return value, nil
+	}
+	body, err := doc.objectBodyContext(ctx, ref)
+	if err != nil {
+		return pdfValue{}, err
+	}
+	resolved, err := newPDFValueParserContext(ctx, body).parseValue()
+	if err != nil {
+		return pdfValue{}, fmt.Errorf("invalid PDF object %d %d R: %w", ref.num, ref.gen, err)
+	}
+	if resolved.kind == pdfValueRef {
+		return pdfValue{}, fmt.Errorf("PDF object %d %d R is only a reference", ref.num, ref.gen)
+	}
+	return resolved, nil
+}
+
+// resolvePDFBoxContext resolves an indirect page box and indirect numbers in it.
+func (doc *Source) resolvePDFBoxContext(ctx context.Context, value pdfValue) (pdfValue, error) {
+	value, err := doc.resolvePDFValueContext(ctx, value)
+	if err != nil || value.kind != pdfValueArray {
+		return value, err
+	}
+	for i, item := range value.array {
+		if item.kind != pdfValueRef {
+			continue
+		}
+		if value.array[i], err = doc.resolvePDFValueContext(ctx, item); err != nil {
+			return pdfValue{}, err
+		}
+	}
+	return value, nil
+}
+
+// resolveContentsArrayContext replaces /Contents that names an indirect array
+// of streams with that array. A reference to a stream is kept as it is.
+func (doc *Source) resolveContentsArrayContext(ctx context.Context, contents pdfValue) (pdfValue, error) {
+	if contents.kind != pdfValueRef {
+		return contents, nil
+	}
+	resolved, err := doc.resolvePDFValueContext(ctx, contents)
+	if err != nil {
+		return pdfValue{}, err
+	}
+	if resolved.kind == pdfValueArray {
+		return resolved, nil
+	}
+	return contents, nil
 }
 
 func (doc *Source) Page(pageNo int, boxName string) (*PageRef, error) {
@@ -1165,10 +1260,14 @@ func (doc *Source) pageContentContext(ctx context.Context, page sourcePage) ([]b
 	if page.contents.kind == pdfValueNull || len(page.contents.raw) == 0 {
 		return nil, nil
 	}
+	contents, err := doc.resolveContentsArrayContext(ctx, page.contents)
+	if err != nil {
+		return nil, err
+	}
 	var out bytes.Buffer
-	values := []pdfValue{page.contents}
-	if page.contents.kind == pdfValueArray {
-		values = page.contents.array
+	values := []pdfValue{contents}
+	if contents.kind == pdfValueArray {
+		values = contents.array
 	}
 	for _, value := range values {
 		if err := importContextErr(ctx); err != nil {
@@ -1208,7 +1307,14 @@ func (doc *Source) encodedPageContentContext(ctx context.Context, page sourcePag
 	if box.llx != 0 || box.lly != 0 {
 		return nil, "", false, nil
 	}
-	ref, ok := singleContentStreamRef(page.contents)
+	contents, err := doc.resolveContentsArrayContext(ctx, page.contents)
+	if err != nil {
+		if ctxErr := importContextErr(ctx); ctxErr != nil {
+			return nil, "", false, ctxErr
+		}
+		return nil, "", false, nil
+	}
+	ref, ok := singleContentStreamRef(contents)
 	if !ok {
 		return nil, "", false, nil
 	}
@@ -1334,15 +1440,26 @@ func (doc *Source) objectBodyContext(ctx context.Context, ref ObjRef) ([]byte, e
 		doc.cache[ref] = body
 		return body, nil
 	}
-	if offset < 0 || offset >= len(doc.data) {
-		return nil, fmt.Errorf("PDF object %d %d R has invalid offset", ref.num, ref.gen)
-	}
 	if err := importContextErr(ctx); err != nil {
 		return nil, err
 	}
-	body, found, err := doc.objectBodyFromBytesContext(ctx, ref, doc.data[offset:])
+	var body []byte
+	found := false
+	err := fmt.Errorf("PDF object %d %d R has invalid offset", ref.num, ref.gen)
+	if offset >= 0 && offset < len(doc.data) {
+		body, found, err = doc.objectBodyFromBytesContext(ctx, ref, doc.data[offset:], true)
+	}
 	if err != nil {
-		return nil, err
+		// An xref entry that does not lead to its object header (offsets
+		// counted before line endings were converted, or after bytes were
+		// added) is looked up by scanning the file for the header.
+		recovered, ok := doc.recoveredObjectOffset(ctx, ref)
+		if !ok || recovered == offset {
+			return nil, err
+		}
+		if body, found, err = doc.objectBodyFromBytesContext(ctx, ref, doc.data[recovered:], true); err != nil {
+			return nil, err
+		}
 	}
 	if !found {
 		return nil, fmt.Errorf("PDF object %d %d R is missing endobj", ref.num, ref.gen)
@@ -1356,7 +1473,7 @@ func (doc *Source) readerAtObjectBodyContext(ctx context.Context, ref ObjRef, of
 	if remain := int(doc.readerSize) - offset; remain < limit {
 		limit = remain
 	}
-	for size := minInt(64*1024, limit); size <= limit; size *= 2 {
+	for size := minInt(64*1024, limit); ; size = minInt(size*2, limit) {
 		if err := importContextErr(ctx); err != nil {
 			return nil, err
 		}
@@ -1364,14 +1481,13 @@ func (doc *Source) readerAtObjectBodyContext(ctx context.Context, ref ObjRef, of
 		if err != nil {
 			return nil, err
 		}
-		if body, ok, err := doc.objectBodyFromBytesContext(ctx, ref, data); err != nil || ok {
+		if body, ok, err := doc.objectBodyFromBytesContext(ctx, ref, data, size >= limit); err != nil || ok {
 			return body, err
 		}
-		if size == limit {
+		// Halving an odd limit and doubling it back never reaches the limit, so
+		// the window is capped at the limit and the loop ends once it got there.
+		if size >= limit {
 			break
-		}
-		if size*2 > limit {
-			size = limit / 2
 		}
 	}
 	return nil, fmt.Errorf("PDF object %d %d R is missing endobj", ref.num, ref.gen)
@@ -1384,20 +1500,62 @@ func minInt(a, b int) int {
 	return b
 }
 
-func (doc *Source) objectBodyFromBytesContext(ctx context.Context, ref ObjRef, data []byte) ([]byte, bool, error) {
+// objectBodyFromBytesContext returns the body of the object that starts data.
+// complete reports that data reaches the end of the file, so a stream whose
+// /Length runs past it is measured instead of read further.
+func (doc *Source) objectBodyFromBytesContext(ctx context.Context, ref ObjRef, data []byte, complete bool) ([]byte, bool, error) {
+	body, _, found, err := doc.objectSpanContext(ctx, ref, data, complete)
+	return body, found, err
+}
+
+// objectSpanContext is objectBodyFromBytesContext that also returns where the
+// object ends in data. A stream whose /Length does not reach its endstream is
+// measured, and its body is rewritten with the measured direct /Length, so
+// every later reader of the body sees a consistent stream.
+func (doc *Source) objectSpanContext(ctx context.Context, ref ObjRef, data []byte, complete bool) ([]byte, int, bool, error) {
 	bodyStart, err := objectBodyStart(data, ref)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
-	end, found, err := doc.objectBodyEndContext(ctx, ref, data, bodyStart)
+	end, found, fix, err := doc.objectBodyEndContext(ctx, ref, data, bodyStart, complete)
 	if err != nil || !found {
-		return nil, found, err
+		return nil, 0, found, err
+	}
+	if fix != nil {
+		body, err := repairedStreamBody(ctx, data[bodyStart:fix.keyword], data[fix.dataStart:fix.dataEnd])
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("PDF object %d %d R has invalid stream dictionary: %w", ref.num, ref.gen, err)
+		}
+		return body, end, true, nil
 	}
 	body := bytes.TrimSpace(data[bodyStart:end])
 	if body == nil {
 		body = []byte{}
 	}
-	return body, true, nil
+	return body, end, true, nil
+}
+
+// streamRepair locates, within the data an object was read from, the stream
+// keyword and the stream bytes measured up to endstream.
+type streamRepair struct {
+	keyword, dataStart, dataEnd int
+}
+
+func repairedStreamBody(ctx context.Context, dictBytes, stream []byte) ([]byte, error) {
+	dict, err := parsePDFObjectDictContext(ctx, dictBytes)
+	if err != nil {
+		return nil, err
+	}
+	dict["Length"] = pdfValue{kind: pdfValueNumber, number: float64(len(stream)), raw: []byte(strconv.Itoa(len(stream)))}
+	var out bytes.Buffer
+	keep := func(b []byte) ([]byte, error) { return b, nil }
+	if err := writeNormalizedPDFValue(&out, pdfValue{kind: pdfValueDict, dict: dict}, keep); err != nil {
+		return nil, err
+	}
+	out.WriteString("\nstream\n")
+	out.Write(stream)
+	out.WriteString("\nendstream")
+	return out.Bytes(), nil
 }
 
 // startsPDFFileStructure reports whether pos begins a cross-reference
@@ -1431,11 +1589,12 @@ func objectBodyStart(data []byte, ref ObjRef) (int, error) {
 	return pos + len("obj"), nil
 }
 
-func (doc *Source) objectBodyEndContext(ctx context.Context, ref ObjRef, data []byte, bodyStart int) (int, bool, error) {
+func (doc *Source) objectBodyEndContext(ctx context.Context, ref ObjRef, data []byte, bodyStart int, complete bool) (int, bool, *streamRepair, error) {
+	var fix *streamRepair
 	for pos := bodyStart; pos < len(data); {
 		if pos%1024 == 0 {
 			if err := importContextErr(ctx); err != nil {
-				return 0, false, err
+				return 0, false, nil, err
 			}
 		}
 		switch data[pos] {
@@ -1468,28 +1627,33 @@ func (doc *Source) objectBodyEndContext(ctx context.Context, ref ObjRef, data []
 		word := string(data[start:pos])
 		switch word {
 		case "endobj":
-			return start, true, nil
+			return start, true, fix, nil
 		case "stream":
-			next, complete, err := doc.skipObjectStreamContext(ctx, ref, data, bodyStart, start, pos)
-			if err != nil || !complete {
-				return 0, complete, err
+			next, done, streamFix, err := doc.skipObjectStreamContext(ctx, ref, data, bodyStart, start, pos, complete)
+			if err != nil || !done {
+				return 0, done, nil, err
 			}
-			pos = next
+			pos, fix = next, streamFix
 			// Some writers (pypdf incremental updates among them) omit endobj
 			// after a stream. A stream object cannot continue past endstream, so
 			// the next file-structure keyword or object header also ends it.
-			if after := skipPDFSpace(data, pos); after < len(data) && startsPDFFileStructure(data, after) {
-				return pos, true, nil
+			if after := skipPDFSpace(data, pos); after >= len(data) && complete || after < len(data) && startsPDFFileStructure(data, after) {
+				return pos, true, fix, nil
 			}
 		}
 	}
-	return 0, false, nil
+	return 0, false, nil, nil
 }
 
-func (doc *Source) skipObjectStreamContext(ctx context.Context, ref ObjRef, data []byte, bodyStart, streamStart, afterStream int) (int, bool, error) {
+// skipObjectStreamContext returns the position after the endstream of the
+// stream whose keyword ends at afterStream. When /Length does not lead to
+// endstream (a writer counted the bytes wrong, or line endings were converted
+// after writing), the stream is measured up to the first endstream instead, as
+// conforming readers recover it, and the measured span is returned for repair.
+func (doc *Source) skipObjectStreamContext(ctx context.Context, ref ObjRef, data []byte, bodyStart, streamStart, afterStream int, complete bool) (int, bool, *streamRepair, error) {
 	dict, err := parsePDFObjectDictContext(ctx, data[bodyStart:streamStart])
 	if err != nil {
-		return 0, false, fmt.Errorf("PDF object %d %d R has invalid stream dictionary: %w", ref.num, ref.gen, err)
+		return 0, false, nil, fmt.Errorf("PDF object %d %d R has invalid stream dictionary: %w", ref.num, ref.gen, err)
 	}
 	pos := afterStream
 	if pos+1 < len(data) && data[pos] == '\r' && data[pos+1] == '\n' {
@@ -1497,70 +1661,77 @@ func (doc *Source) skipObjectStreamContext(ctx context.Context, ref ObjRef, data
 	} else if pos < len(data) && (data[pos] == '\r' || data[pos] == '\n') {
 		pos++
 	} else if pos >= len(data) {
-		return 0, false, nil
+		return 0, false, nil, nil
 	} else {
-		return 0, false, errors.New("PDF stream marker is not followed by a line break")
+		return 0, false, nil, errors.New("PDF stream marker is not followed by a line break")
 	}
+	dataStart := pos
 
-	length, known, err := doc.pdfStreamLengthContext(ctx, dict)
-	if err != nil {
-		return 0, false, err
+	length, err := doc.pdfStreamLengthContext(ctx, dict)
+	if ctxErr := importContextErr(ctx); ctxErr != nil {
+		return 0, false, nil, ctxErr
 	}
-	if known {
-		if length > len(data)-pos {
-			return 0, false, nil
+	if err == nil {
+		if length > len(data)-pos && !complete {
+			return 0, false, nil, nil
 		}
-		pos += length
-	} else {
-		end := bytes.Index(data[pos:], []byte("endstream"))
-		if end < 0 {
-			return 0, false, nil
+		if length <= len(data)-pos {
+			if end := skipPDFLineBreaks(data, pos+length); hasPDFWord(data, end, "endstream") {
+				return end + len("endstream"), true, nil, nil
+			}
 		}
-		pos += end
 	}
-	pos = skipPDFLineBreaks(data, pos)
-	if !hasPDFWord(data, pos, "endstream") {
-		if pos >= len(data) {
-			return 0, false, nil
+	end := bytes.Index(data[dataStart:], []byte("endstream"))
+	if end < 0 {
+		if !complete {
+			return 0, false, nil, nil
 		}
-		return 0, false, fmt.Errorf("PDF object %d %d R is missing endstream", ref.num, ref.gen)
+		return 0, false, nil, fmt.Errorf("PDF object %d %d R is missing endstream", ref.num, ref.gen)
 	}
-	return pos + len("endstream"), true, nil
+	dataEnd := dataStart + end
+	// The end-of-line marker before endstream is not part of the data.
+	if dataEnd > dataStart && data[dataEnd-1] == '\n' {
+		dataEnd--
+	}
+	if dataEnd > dataStart && data[dataEnd-1] == '\r' {
+		dataEnd--
+	}
+	return dataStart + end + len("endstream"), true, &streamRepair{keyword: streamStart, dataStart: dataStart, dataEnd: dataEnd}, nil
 }
 
-func (doc *Source) pdfStreamLengthContext(ctx context.Context, dict pdfDict) (int, bool, error) {
+func (doc *Source) pdfStreamLengthContext(ctx context.Context, dict pdfDict) (int, error) {
 	value, ok := dict["Length"]
 	if !ok {
-		return 0, false, errors.New("PDF stream dictionary does not contain Length")
+		return 0, errors.New("PDF stream dictionary does not contain Length")
 	}
 	if value.kind == pdfValueNumber {
 		length, err := pdfValueNonnegativeInt(value)
 		if err != nil {
-			return 0, false, errors.New("PDF stream length is invalid")
+			return 0, errors.New("PDF stream length is invalid")
 		}
-		return length, true, nil
+		return length, nil
 	}
 	ref, ok := pdfValueAsRef(value)
 	if !ok {
-		return 0, false, errors.New("PDF stream length is invalid")
+		return 0, errors.New("PDF stream length is invalid")
 	}
 	body, err := doc.objectBodyContext(ctx, ref)
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	parser := newPDFValueParserContext(ctx, body)
 	value, err = parser.parseValue()
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	if value.kind != pdfValueNumber {
-		return 0, false, errors.New("PDF stream length is invalid")
+		return 0, errors.New("PDF stream length is invalid")
 	}
 	length, err := pdfValueNonnegativeInt(value)
 	if err != nil {
-		return 0, false, errors.New("PDF stream length is invalid")
+		return 0, errors.New("PDF stream length is invalid")
 	}
-	return length, true, nil
+	return length, nil
 }
 
 func (doc *Source) readAtContext(ctx context.Context, offset, length int) ([]byte, error) {
@@ -1620,11 +1791,11 @@ func (doc *Source) parseStreamContext(ctx context.Context, body []byte) (pdfDict
 	} else if start < len(body) && (body[start] == '\n' || body[start] == '\r') {
 		start++
 	}
-	length, known, err := doc.pdfStreamLengthContext(ctx, dict)
+	length, err := doc.pdfStreamLengthContext(ctx, dict)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !known || start > len(body) || length > len(body)-start {
+	if start > len(body) || length > len(body)-start {
 		return nil, nil, errors.New("PDF stream length exceeds object bounds")
 	}
 	return dict, body[start : start+length], nil
@@ -1770,6 +1941,11 @@ func pdfStreamFilters(value pdfValue) ([]string, error) {
 func (page sourcePage) selectedBox(name string) (pdfBox, error) {
 	boxName := normalizePDFPageBoxName(name)
 	value, ok := page.boxes[boxName]
+	// BleedBox, TrimBox and ArtBox default to the CropBox, which defaults to
+	// the MediaBox (ISO 32000-1, table 30).
+	if !ok && boxName != "MediaBox" && boxName != "CropBox" {
+		value, ok = page.boxes["CropBox"]
+	}
 	if !ok && boxName != "MediaBox" {
 		value, ok = page.boxes["MediaBox"]
 	}
@@ -1919,7 +2095,10 @@ func (p *pdfValueParser) parseValue() (pdfValue, error) {
 	if err != nil {
 		return pdfValue{}, err
 	}
-	value.raw = append([]byte(nil), p.data[start:p.pos]...)
+	// The raw form shares the immutable input: copying it at every level kept
+	// one copy of a nested value per enclosing array or dictionary. The full
+	// slice expression stops an append from writing into the input.
+	value.raw = p.data[start:p.pos:p.pos]
 	return value, nil
 }
 
