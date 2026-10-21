@@ -144,10 +144,12 @@ func sanitizePDFObjectWithReferences(data []byte, preserveKeys bool) (sanitizedP
 		// value and parsing it as one could mistake image or font bytes for
 		// syntax, but arbitrary trailing bytes must never be accepted as a
 		// stream implicitly.
-		if err := validatePDFStreamSuffix(data, tail.pos, scanner.rootLength, scanner.rootLengthSeen); err != nil {
+		suffix, err := validatePDFStreamSuffix(data, tail.pos, scanner.rootLength, scanner.rootLengthSeen)
+		if err != nil {
 			return sanitizedPDFObject{}, err
 		}
-		value = append(value, data[end:]...)
+		value = append(value, data[end:tail.pos]...)
+		value = append(value, suffix...)
 	}
 	// Classify references from the sanitized value rather than the hostile
 	// source. References in entries that were removed above must not remain
@@ -299,7 +301,10 @@ func (s *pdfValueScanner) sanitizeDict(preserveKeys bool) ([]byte, int, bool, er
 				return nil, s.pos, false, fmt.Errorf("indirect PDF /%s values are not allowed", key)
 			}
 		}
-		if !preserveKeys && (key == "Filter" || key == "DecodeParms") && len(indirectRefKeys(value)) > 0 {
+		if !preserveKeys && key == "Filter" && len(indirectRefKeys(value)) > 0 {
+			return nil, s.pos, false, fmt.Errorf("indirect PDF /%s values are not allowed", key)
+		}
+		if !preserveKeys && key == "DecodeParms" && !decodeParmsRefsAllowed(value) {
 			return nil, s.pos, false, fmt.Errorf("indirect PDF /%s values are not allowed", key)
 		}
 		if (!preserveKeys && removedPDFKeys[key]) || valueDrop || valueIsAction {
@@ -489,9 +494,15 @@ func pdfHexValue(ch byte) (byte, bool) {
 	}
 }
 
-func validatePDFStreamSuffix(data []byte, pos int, lengthValue []byte, lengthSeen bool) error {
+// validatePDFStreamSuffix checks the stream suffix that starts at pos and
+// returns it. When a direct Length ends exactly at an endstream keyword that is
+// not preceded by an end-of-line marker, a producer omission conforming readers
+// accept, the returned suffix inserts that marker so the reconstructed stream is
+// well formed. Every other byte is returned unchanged.
+func validatePDFStreamSuffix(data []byte, pos int, lengthValue []byte, lengthSeen bool) ([]byte, error) {
+	start := pos
 	if pos < 0 || pos > len(data)-len("stream") || string(data[pos:pos+len("stream")]) != "stream" {
-		return errors.New("unexpected bytes after PDF value")
+		return nil, errors.New("unexpected bytes after PDF value")
 	}
 	pos += len("stream")
 	if pos+1 < len(data) && data[pos] == '\r' && data[pos+1] == '\n' {
@@ -499,37 +510,57 @@ func validatePDFStreamSuffix(data []byte, pos int, lengthValue []byte, lengthSee
 	} else if pos < len(data) && (data[pos] == '\r' || data[pos] == '\n') {
 		pos++
 	} else {
-		return errors.New("PDF stream marker is not followed by a line break")
+		return nil, errors.New("PDF stream marker is not followed by a line break")
 	}
 	if !lengthSeen {
-		return errors.New("PDF stream dictionary does not contain Length")
+		return nil, errors.New("PDF stream dictionary does not contain Length")
 	}
 	length, direct, err := directPDFStreamLength(lengthValue)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var end int
+	missingEOL := false
 	if direct {
 		if length > len(data)-pos {
-			return errors.New("PDF stream length exceeds object bounds")
+			return nil, errors.New("PDF stream length exceeds object bounds")
 		}
 		end = skipPDFLineBreaks(data, pos+length)
-		if !hasPDFToken(data, end, "endstream") {
-			return errors.New("PDF stream length does not end at endstream")
+		if end == pos+length && end > pos && hasPDFKeywordEnd(data, end, "endstream") {
+			missingEOL = true
+		} else if !hasPDFToken(data, end, "endstream") {
+			return nil, errors.New("PDF stream length does not end at endstream")
 		}
 	} else {
 		end = firstPDFEndstream(data, pos)
 	}
 	if end < 0 {
-		return errors.New("PDF stream is missing endstream")
+		return nil, errors.New("PDF stream is missing endstream")
 	}
 	after := end + len("endstream")
 	tail := &pdfValueScanner{data: data, pos: after}
 	tail.skipSpace()
 	if tail.pos != len(data) {
-		return errors.New("unexpected bytes after PDF endstream")
+		return nil, errors.New("unexpected bytes after PDF endstream")
 	}
-	return nil
+	if !missingEOL {
+		return data[start:], nil
+	}
+	suffix := make([]byte, 0, len(data)-start+1)
+	suffix = append(suffix, data[start:end]...)
+	suffix = append(suffix, '\n')
+	return append(suffix, data[end:]...), nil
+}
+
+// hasPDFKeywordEnd reports whether keyword starts at pos and is followed by a
+// delimiter, white space, or the end of data, without constraining the byte
+// before pos.
+func hasPDFKeywordEnd(data []byte, pos int, keyword string) bool {
+	if pos+len(keyword) > len(data) || string(data[pos:pos+len(keyword)]) != keyword {
+		return false
+	}
+	end := pos + len(keyword)
+	return end == len(data) || pdfSpace(data[end]) || pdfDelimiter(data[end])
 }
 
 func directPDFStreamLength(value []byte) (int, bool, error) {
@@ -809,4 +840,86 @@ func hasPDFStreamKeyword(data []byte, pos int) bool {
 	}
 	end := pos + len("stream")
 	return end < len(data) && (data[end] == '\r' || data[end] == '\n')
+}
+
+// decodeParmsRefsAllowed reports whether every indirect reference in a
+// sanitized /DecodeParms value is the /JBIG2Globals stream of a direct
+// parameter dictionary (or array of them). Scanned documents commonly share
+// one JBIG2 globals segment; that stream is reconstructed as an ordinary
+// object like any other image data. Any other reference stays disallowed.
+func decodeParmsRefsAllowed(value []byte) bool {
+	if len(indirectRefKeys(value)) == 0 {
+		return true
+	}
+	if _, indirect := singleIndirectRefKey(value); indirect {
+		return false
+	}
+	scanner := &pdfValueScanner{data: value, resourceNameRefs: make(map[refKey]bool), normalRefCounts: make(map[refKey]int)}
+	scanner.skipSpace()
+	switch {
+	case scanner.has("<<"):
+		return jbig2GlobalsOnlyDict(scanner)
+	case scanner.has("["):
+		scanner.pos++
+		for {
+			scanner.skipSpace()
+			if scanner.pos >= len(value) {
+				return false
+			}
+			if value[scanner.pos] == ']' {
+				return true
+			}
+			if scanner.has("<<") {
+				if !jbig2GlobalsOnlyDict(scanner) {
+					return false
+				}
+				continue
+			}
+			start := scanner.pos
+			_, end, _, err := scanner.sanitizeValue()
+			if err != nil || len(indirectRefKeys(value[start:end])) > 0 {
+				return false
+			}
+			scanner.pos = end
+		}
+	default:
+		return false
+	}
+}
+
+// jbig2GlobalsOnlyDict consumes one direct dictionary at the scanner position
+// and reports whether its only indirect reference is a /JBIG2Globals value.
+func jbig2GlobalsOnlyDict(scanner *pdfValueScanner) bool {
+	data := scanner.data
+	scanner.pos += 2
+	for {
+		scanner.skipSpace()
+		if scanner.has(">>") {
+			scanner.pos += 2
+			return true
+		}
+		if scanner.pos >= len(data) || data[scanner.pos] != '/' {
+			return false
+		}
+		keyStart := scanner.pos + 1
+		keyEnd := scanner.nameEnd()
+		key, err := canonicalPDFName(data[keyStart:keyEnd])
+		if err != nil {
+			return false
+		}
+		scanner.skipSpace()
+		valueStart := scanner.pos
+		_, valueEnd, _, err := scanner.sanitizeValue()
+		if err != nil {
+			return false
+		}
+		scanner.pos = valueEnd
+		entry := data[valueStart:valueEnd]
+		if len(indirectRefKeys(entry)) == 0 {
+			continue
+		}
+		if _, single := singleIndirectRefKey(entry); !single || key != "JBIG2Globals" {
+			return false
+		}
+	}
 }

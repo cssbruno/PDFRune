@@ -55,6 +55,9 @@ type Options struct {
 	MaxResourceBytes     int64
 	MaxOutputBytes       int64
 	MaxObjects           int
+	// Password opens a source encrypted with the standard security handler; see
+	// importpdf.ImportOptions.Password. The reconstruction is never encrypted.
+	Password string
 }
 
 func (o Options) normalized() (Options, error) {
@@ -90,6 +93,7 @@ func (o Options) importOptions() importpdf.ImportOptions {
 	return importpdf.ImportOptions{
 		MaxSourceBytes:       o.MaxSourceBytes,
 		MaxReferencedObjects: o.MaxReferencedObjects,
+		Password:             o.Password,
 	}
 }
 
@@ -310,7 +314,9 @@ func reconstruct(ctx context.Context, source *importpdf.Source, options Options)
 		if err := contextError(ctx); err != nil {
 			return nil, err
 		}
-		page, err := source.PageContext(ctx, pageNumber, "MediaBox")
+		// The crop box (clipped to the media box, falling back to it) is the
+		// visible page; reconstructing it keeps what readers show.
+		page, err := source.PageContext(ctx, pageNumber, "CropBox")
 		if err != nil {
 			return nil, fmt.Errorf("reconstruct page %d: %w", pageNumber, err)
 		}
@@ -351,7 +357,7 @@ func reconstruct(ctx context.Context, source *importpdf.Source, options Options)
 			if !ok {
 				continue
 			}
-			if retained.preserveKeys != object.preserveKeys {
+			if retained.preserveKeys != object.preserveKeys && !bytes.Equal(retained.body, object.body) {
 				return nil, fmt.Errorf(
 					"reconstruct page %d resources: %w",
 					pageNumber,
@@ -451,9 +457,13 @@ func reconstruct(ctx context.Context, source *importpdf.Source, options Options)
 		if err := set(contentID, pdfStreamBody(content)); err != nil {
 			return nil, err
 		}
+		rotate := ""
+		if rotation := page.Rotation(); rotation != 0 {
+			rotate = fmt.Sprintf(" /Rotate %d", rotation)
+		}
 		if err := set(pageID, []byte(fmt.Sprintf(
-			"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %d 0 R /Contents %d 0 R >>",
-			pagesID, pdfNumber(width), pdfNumber(height), resourceID, contentID,
+			"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s]%s /Resources %d 0 R /Contents %d 0 R >>",
+			pagesID, pdfNumber(width), pdfNumber(height), rotate, resourceID, contentID,
 		))); err != nil {
 			return nil, err
 		}
@@ -529,7 +539,38 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	if err != nil {
 		return nil, err
 	}
-	if ref, ok := conflictingReferenceRole(root.resourceNameRefs, root.normalRefs); ok {
+	// roleIndependent reports whether the referenced object sanitizes to the
+	// same value and child references under both roles. Only a dictionary at
+	// the top of the object is affected by the role, so a color space array
+	// shared by a /ColorSpace resource entry and an image's /ColorSpace is the
+	// same object in either role and is not ambiguous.
+	roleIndependent := func(key refKey) bool {
+		ref, ok := byKey[key]
+		if !ok {
+			return false
+		}
+		body := inlineStreamParameterRefs(objects[ref], objects)
+		asResource, err := sanitizePDFObjectWithReferences(body, true)
+		if err != nil {
+			return false
+		}
+		asOrdinary, err := sanitizePDFObjectWithReferences(body, false)
+		if err != nil {
+			return false
+		}
+		return bytes.Equal(asResource.value, asOrdinary.value) &&
+			sameRefKeys(asResource.resourceNameRefs, asOrdinary.resourceNameRefs) &&
+			sameRefKeys(asResource.normalRefs, asOrdinary.normalRefs)
+	}
+	conflict := func(resourceRefs, normalRefs map[refKey]bool) (refKey, bool) {
+		for ref := range resourceRefs {
+			if normalRefs[ref] && !roleIndependent(ref) {
+				return ref, true
+			}
+		}
+		return refKey{}, false
+	}
+	if ref, ok := conflict(root.resourceNameRefs, root.normalRefs); ok {
 		return nil, ambiguousResourceReferenceError(ref)
 	}
 	type queuedReference struct {
@@ -541,7 +582,7 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	enqueue := func(refs map[refKey]bool, preserveKeys bool) error {
 		for key := range refs {
 			if previous, exists := roles[key]; exists {
-				if previous != preserveKeys {
+				if previous != preserveKeys && !roleIndependent(key) {
 					return ambiguousResourceReferenceError(key)
 				}
 				continue
@@ -574,11 +615,12 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 		if !ok {
 			return nil, fmt.Errorf("referenced object %s is missing", ref)
 		}
+		body = inlineStreamParameterRefs(body, objects)
 		sanitized, err := sanitizePDFObjectWithReferences(body, pending.preserveKeys)
 		if err != nil {
 			return nil, fmt.Errorf("object %s: %w", ref, err)
 		}
-		if child, ok := conflictingReferenceRole(sanitized.resourceNameRefs, sanitized.normalRefs); ok {
+		if child, ok := conflict(sanitized.resourceNameRefs, sanitized.normalRefs); ok {
 			return nil, fmt.Errorf("object %s: %w", ref, ambiguousResourceReferenceError(child))
 		}
 		processed[ref] = true
@@ -607,13 +649,16 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	return result, nil
 }
 
-func conflictingReferenceRole(resourceRefs, normalRefs map[refKey]bool) (refKey, bool) {
-	for ref := range resourceRefs {
-		if normalRefs[ref] {
-			return ref, true
+func sameRefKeys(left, right map[refKey]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for ref := range left {
+		if !right[ref] {
+			return false
 		}
 	}
-	return refKey{}, false
+	return true
 }
 
 func ambiguousResourceReferenceError(ref refKey) error {

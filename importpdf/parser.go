@@ -68,6 +68,16 @@ type PageRef struct {
 	encodedContentFilter string
 	objects              map[ObjRef][]byte
 	objectRefs           []ObjRef
+	rotation             int
+}
+
+// Rotation returns the page's /Rotate value (inherited through the page tree)
+// normalized to 0, 90, 180, or 270 degrees clockwise. Invalid values read as 0.
+func (p *PageRef) Rotation() int {
+	if p == nil {
+		return 0
+	}
+	return p.rotation
 }
 
 // WidthPoints returns the imported page width in PDF points.
@@ -460,6 +470,7 @@ type sourcePage struct {
 	resources pdfValue
 	boxes     map[string]pdfValue
 	contents  pdfValue
+	rotation  int
 }
 
 const (
@@ -523,7 +534,55 @@ type pdfBox struct {
 	urx, ury float64
 }
 
+// parseSourceWithOptionsContext parses a classic-xref PDF directly. A source
+// that uses cross-reference streams, object streams, or encryption is first
+// normalized into an equivalent classic, unencrypted PDF and then parsed by
+// the same classic parser.
 func parseSourceWithOptionsContext(ctx context.Context, data []byte, options ImportOptions) (*Source, error) {
+	doc, err := parseNormalizedSourceContext(ctx, data, options)
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return doc, err
+	}
+	// ISO 32000 lets the %PDF- header start anywhere in the first 1024 bytes.
+	// When bytes were prepended to a finished file (a UTF-8 BOM, a web
+	// framework's preamble), its offsets count from the header, so a source
+	// that failed as given is read once more from there.
+	if header := pdfHeaderOffset(data); header > 0 {
+		shifted, shiftedErr := parseNormalizedSourceContext(ctx, data[header:], options)
+		if shiftedErr == nil || errors.Is(shiftedErr, ErrPasswordRequired) || errors.Is(shiftedErr, ErrIncorrectPassword) {
+			return shifted, shiftedErr
+		}
+	}
+	return nil, err
+}
+
+// pdfHeaderOffset returns the position of %PDF- within the first 1024 bytes,
+// or -1.
+func pdfHeaderOffset(data []byte) int {
+	limit := len(data)
+	if limit > 1024 {
+		limit = 1024
+	}
+	return bytes.Index(data[:limit], []byte("%PDF-"))
+}
+
+func parseNormalizedSourceContext(ctx context.Context, data []byte, options ImportOptions) (*Source, error) {
+	doc, err := parseClassicSourceContext(ctx, data, options)
+	if !errors.Is(err, errNeedsNormalization) {
+		return doc, err
+	}
+	normalized, err := normalizeSourceContext(ctx, data, options)
+	if err != nil {
+		return nil, err
+	}
+	doc, err = parseClassicSourceContext(ctx, normalized, options)
+	if errors.Is(err, errNeedsNormalization) {
+		return nil, errors.New("normalized PDF is not a classic unencrypted PDF")
+	}
+	return doc, err
+}
+
+func parseClassicSourceContext(ctx context.Context, data []byte, options ImportOptions) (*Source, error) {
 	if err := importContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -562,13 +621,16 @@ func parseSourceWithOptionsContext(ctx context.Context, data []byte, options Imp
 		if err != nil {
 			return nil, err
 		}
+		if _, ok := trailer["XRefStm"]; ok {
+			return nil, errNeedsNormalization
+		}
 		if doc.trailer == nil {
 			doc.trailer = trailer
 		}
 		start = prev
 	}
 	if _, ok := doc.trailer["Encrypt"]; ok {
-		return nil, errors.New("encrypted PDFs are not supported by the built-in importer")
+		return nil, errNeedsNormalization
 	}
 	root, ok := pdfValueAsRef(doc.trailer["Root"])
 	if !ok {
@@ -584,7 +646,26 @@ func parseSourceWithOptionsContext(ctx context.Context, data []byte, options Imp
 	return doc, nil
 }
 
+// parseSourceReaderAtWithOptionsContext parses a classic-xref PDF lazily. A
+// source that needs normalization is read once into memory, bounded by the
+// already-checked size, and parsed through the byte path.
 func parseSourceReaderAtWithOptionsContext(ctx context.Context, r io.ReaderAt, size int64, options ImportOptions) (*Source, error) {
+	doc, err := parseClassicSourceReaderAtContext(ctx, r, size, options)
+	if !errors.Is(err, errNeedsNormalization) {
+		return doc, err
+	}
+	data := make([]byte, size)
+	read, err := r.ReadAt(data, 0)
+	if int64(read) != size {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	return parseSourceWithOptionsContext(ctx, data, options)
+}
+
+func parseClassicSourceReaderAtContext(ctx context.Context, r io.ReaderAt, size int64, options ImportOptions) (*Source, error) {
 	if err := importContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -624,13 +705,16 @@ func parseSourceReaderAtWithOptionsContext(ctx context.Context, r io.ReaderAt, s
 		if err != nil {
 			return nil, err
 		}
+		if _, ok := trailer["XRefStm"]; ok {
+			return nil, errNeedsNormalization
+		}
 		if doc.trailer == nil {
 			doc.trailer = trailer
 		}
 		start = prev
 	}
 	if _, ok := doc.trailer["Encrypt"]; ok {
-		return nil, errors.New("encrypted PDFs are not supported by the built-in importer")
+		return nil, errNeedsNormalization
 	}
 	root, ok := pdfValueAsRef(doc.trailer["Root"])
 	if !ok {
@@ -669,7 +753,7 @@ func (doc *Source) parseXrefAtContext(ctx context.Context, offset int) (pdfDict,
 	}
 	p := skipPDFSpace(doc.data, offset)
 	if !hasPDFWord(doc.data, p, "xref") {
-		return nil, 0, errors.New("PDF xref streams are not supported by the built-in importer")
+		return nil, 0, errNeedsNormalization
 	}
 	p += len("xref")
 	tableSeen := make(map[int]bool)
@@ -793,7 +877,7 @@ func (doc *Source) parseReaderAtXrefAtContext(ctx context.Context, offset int) (
 	}
 	p := skipPDFSpace(data, 0)
 	if !hasPDFWord(data, p, "xref") {
-		return nil, 0, errors.New("PDF xref streams are not supported by the built-in importer")
+		return nil, 0, errNeedsNormalization
 	}
 	p += len("xref")
 	tableSeen := make(map[int]bool)
@@ -904,6 +988,21 @@ func (doc *Source) loadPagesContext(ctx context.Context) error {
 type pdfPageInherited struct {
 	resources pdfValue
 	boxes     map[string]pdfValue
+	rotate    pdfValue
+}
+
+// normalizedPDFRotation maps /Rotate to 0, 90, 180, or 270. A value that is
+// not an integer multiple of 90 is invalid and reads as 0, as in conforming
+// readers.
+func normalizedPDFRotation(value pdfValue) int {
+	if value.kind != pdfValueNumber || value.number != math.Trunc(value.number) || math.Abs(value.number) > 1e9 {
+		return 0
+	}
+	degrees := int(value.number)
+	if degrees%90 != 0 {
+		return 0
+	}
+	return ((degrees % 360) + 360) % 360
 }
 
 func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherited pdfPageInherited, depth int, visiting, seen map[ObjRef]bool) error {
@@ -940,6 +1039,9 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 	if resources, ok := dict["Resources"]; ok {
 		nextInherited.resources = resources
 	}
+	if rotate, ok := dict["Rotate"]; ok {
+		nextInherited.rotate = rotate
+	}
 	for _, name := range pdfPageBoxNames() {
 		if box, ok := dict[name]; ok {
 			if boxesCopied {
@@ -973,6 +1075,7 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 			resources: nextInherited.resources,
 			boxes:     pageBoxes,
 			contents:  contents,
+			rotation:  normalizedPDFRotation(nextInherited.rotate),
 		})
 		return nil
 	}
@@ -1051,6 +1154,7 @@ func (doc *Source) PageContext(ctx context.Context, pageNo int, boxName string) 
 		encodedContentFilter: encodedFilter,
 		objects:              objects,
 		objectRefs:           objectRefs,
+		rotation:             page.rotation,
 	}, nil
 }
 
@@ -1296,6 +1400,16 @@ func (doc *Source) objectBodyFromBytesContext(ctx context.Context, ref ObjRef, d
 	return body, true, nil
 }
 
+// startsPDFFileStructure reports whether pos begins a cross-reference
+// section, a trailer, startxref, or an indirect object header.
+func startsPDFFileStructure(data []byte, pos int) bool {
+	if hasPDFWord(data, pos, "startxref") || hasPDFWord(data, pos, "xref") || hasPDFWord(data, pos, "trailer") {
+		return true
+	}
+	_, ok := indirectObjectRefAt(data, pos)
+	return ok
+}
+
 func objectBodyStart(data []byte, ref ObjRef) (int, error) {
 	pos := skipPDFSpace(data, 0)
 	object, _, next, ok := readPDFIntToken(data, pos)
@@ -1361,6 +1475,12 @@ func (doc *Source) objectBodyEndContext(ctx context.Context, ref ObjRef, data []
 				return 0, complete, err
 			}
 			pos = next
+			// Some writers (pypdf incremental updates among them) omit endobj
+			// after a stream. A stream object cannot continue past endstream, so
+			// the next file-structure keyword or object header also ends it.
+			if after := skipPDFSpace(data, pos); after < len(data) && startsPDFFileStructure(data, after) {
+				return pos, true, nil
+			}
 		}
 	}
 	return 0, false, nil
@@ -1656,7 +1776,27 @@ func (page sourcePage) selectedBox(name string) (pdfBox, error) {
 	if !ok {
 		return pdfBox{}, fmt.Errorf("PDF page does not define %s", boxName)
 	}
-	return pdfValueBox(value)
+	box, err := pdfValueBox(value)
+	if err != nil || boxName == "MediaBox" {
+		return box, err
+	}
+	// Every other page box is clipped to the media box, as readers display it.
+	media, ok := page.boxes["MediaBox"]
+	if !ok {
+		return box, nil
+	}
+	mediaBox, err := pdfValueBox(media)
+	if err != nil {
+		return pdfBox{}, err
+	}
+	clipped := pdfBox{
+		llx: math.Max(box.llx, mediaBox.llx), lly: math.Max(box.lly, mediaBox.lly),
+		urx: math.Min(box.urx, mediaBox.urx), ury: math.Min(box.ury, mediaBox.ury),
+	}
+	if clipped.urx <= clipped.llx || clipped.ury <= clipped.lly {
+		return mediaBox, nil
+	}
+	return clipped, nil
 }
 
 func (doc *Source) PageSizes() map[int]map[string]Size {
@@ -1686,7 +1826,11 @@ func pdfValueBox(value pdfValue) (pdfBox, error) {
 		}
 		nums[i] = item.number
 	}
-	return pdfBox{llx: nums[0], lly: nums[1], urx: nums[2], ury: nums[3]}, nil
+	// ISO 32000 lets a rectangle name any two diagonally opposite corners.
+	return pdfBox{
+		llx: math.Min(nums[0], nums[2]), lly: math.Min(nums[1], nums[3]),
+		urx: math.Max(nums[0], nums[2]), ury: math.Max(nums[1], nums[3]),
+	}, nil
 }
 
 func normalizePDFPageBoxName(name string) string {

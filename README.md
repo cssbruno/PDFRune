@@ -7,7 +7,10 @@ Applications compose them at their own trusted boundary.
 ## Packages
 
 - `sign` adds and verifies detached CMS/PAdES signatures.
-- `importpdf` parses the supported classic-xref PDF subset.
+- `importpdf` parses the supported PDF subset. Cross-reference streams, object
+  streams, and the standard security handler (RC4, AES-128, AES-256) are first
+  normalized into an equivalent classic-xref, unencrypted file; encrypted
+  sources open with `ImportOptions.Password` (user or owner password).
 - `inspect` reports page structure, dimensions, streams, and text.
 - `pdfcdr` reconstructs the supported subset while removing interactive and
   non-rendering document structures.

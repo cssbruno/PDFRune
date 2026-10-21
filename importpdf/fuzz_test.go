@@ -6,6 +6,8 @@ package importpdf
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -13,8 +15,15 @@ func FuzzOpenBytes(f *testing.F) {
 	f.Add([]byte("%PDF-1.4\n%%EOF"))
 	f.Add(minimalFuzzPDF())
 	f.Add([]byte("not a pdf"))
+	// Modern and encrypted fixtures seed the normalization path.
+	for _, name := range []string{"xref-stream.pdf", "rc4-128-object-streams.pdf", "aes-256-owner-only.pdf", "rc4-128-owner-only.pdf"} {
+		if data, err := os.ReadFile(filepath.Join("testdata", name)); err == nil {
+			f.Add(data)
+		}
+	}
 	f.Fuzz(func(t *testing.T, input []byte) {
 		_, _ = OpenBytes(input)
+		_, _ = OpenBytesWithOptions(input, ImportOptions{Password: "senha"})
 	})
 }
 

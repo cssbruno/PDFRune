@@ -17,8 +17,13 @@ keys, or sensitive documents.
 
 Treat imported PDFs as hostile. Use bounded `importpdf` options and `pdfcdr`
 before retaining or opening uploaded documents. `pdfcdr` reconstructs the
-supported classic-xref subset; it is not a rasterizer and does not protect a
-downstream reader from vulnerabilities in image, font, or rendering decoders.
+supported subset; it is not a rasterizer and does not protect a downstream
+reader from vulnerabilities in image, font, or rendering decoders.
+
+A password passed in `ImportOptions.Password` or `pdfcdr.Options.Password` is
+used only to derive the decryption key for that call. The reconstruction is
+never encrypted. Callers must not log, persist, or reuse a password beyond the
+operation that received it.
 
 Applications remain responsible for request-body limits, deadlines, process
 isolation appropriate to their threat model, and keeping PDF readers and the

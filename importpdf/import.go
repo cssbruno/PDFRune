@@ -24,6 +24,12 @@ var ErrSourceTooLarge = errors.New("PDF import source exceeds maximum size")
 type ImportOptions struct {
 	MaxSourceBytes       int64
 	MaxReferencedObjects int
+	// Password opens a PDF encrypted with the standard security handler. Either
+	// the user or the owner password is accepted. An empty Password opens files
+	// that restrict only permissions (no password to open); a file that needs
+	// one fails with ErrPasswordRequired, and a wrong one with
+	// ErrIncorrectPassword.
+	Password string
 }
 
 func normalizeImportOptions(options ImportOptions) (ImportOptions, error) {

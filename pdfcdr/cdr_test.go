@@ -323,12 +323,129 @@ func TestSanitizeRejectsTokensAfterResourceStream(t *testing.T) {
 func TestSanitizeRejectsAmbiguousResourceObjectRole(t *testing.T) {
 	source := resourceGraphPDF(t,
 		"<< /Font 5 0 R /XObject << /Same 5 0 R >> >>",
-		"<< /F1 6 0 R >>",
+		"<< /A 6 0 R >>",
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
 	)
 	_, err := Sanitize(source)
 	if err == nil || !strings.Contains(err.Error(), "both as a resource-name dictionary and as an ordinary object") {
 		t.Fatalf("Sanitize() error = %v, want ambiguous resource-role rejection", err)
+	}
+}
+
+func TestSanitizeAcceptsObjectsThatSanitizeIdenticallyInBothRoles(t *testing.T) {
+	// An indexed color space array is referenced by the page's /ColorSpace
+	// resource map and by the image's own /ColorSpace entry. Only a top-level
+	// dictionary depends on the role, so the shared array is not ambiguous.
+	source := resourceGraphPDF(t,
+		"<< /ColorSpace << /CS0 5 0 R >> /XObject << /Im0 6 0 R >> >>",
+		"[/Indexed /DeviceRGB 1 <000000FFFFFF>]",
+		"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace 5 0 R /Length 1 >>\nstream\n\x00\nendstream",
+	)
+	clean, err := Sanitize(source)
+	if err != nil {
+		t.Fatalf("Sanitize() error = %v", err)
+	}
+	if !bytes.Contains(clean, []byte("/Indexed /DeviceRGB")) {
+		t.Fatal("reconstruction lost the shared color space")
+	}
+}
+
+func TestSanitizeInlinesIndirectDecodeParms(t *testing.T) {
+	source := resourceGraphPDF(t,
+		"<< /XObject << /Im0 5 0 R >> >>",
+		"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /DecodeParms 6 0 R /Length 1 >>\nstream\n\x00\nendstream",
+		"<< /Predictor 1 >>",
+	)
+	clean, err := Sanitize(source)
+	if err != nil {
+		t.Fatalf("Sanitize() error = %v", err)
+	}
+	if !bytes.Contains(clean, []byte("/DecodeParms << /Predictor 1 >>")) {
+		t.Fatalf("indirect /DecodeParms was not inlined:\n%s", clean)
+	}
+}
+
+func TestSanitizeStillRejectsIndirectDecodeParmsWithReferences(t *testing.T) {
+	source := resourceGraphPDF(t,
+		"<< /XObject << /Im0 5 0 R >> >>",
+		"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /DecodeParms 6 0 R /Length 1 >>\nstream\n\x00\nendstream",
+		"<< /Predictor 7 0 R >>",
+		"12",
+	)
+	if _, err := Sanitize(source); err == nil || !strings.Contains(err.Error(), "indirect PDF /DecodeParms") {
+		t.Fatalf("Sanitize() error = %v, want indirect /DecodeParms rejection", err)
+	}
+}
+
+func TestSanitizeKeepsSharedJBIG2Globals(t *testing.T) {
+	for name, decodeParms := range map[string]string{
+		"direct":   "<< /JBIG2Globals 6 0 R >>",
+		"array":    "[<< /JBIG2Globals 6 0 R >>]",
+		"indirect": "7 0 R",
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := resourceGraphPDF(t,
+				"<< /XObject << /Im0 5 0 R >> >>",
+				"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode /DecodeParms "+decodeParms+" /Length 1 >>\nstream\n\x00\nendstream",
+				"<< /Length 3 >>\nstream\nGLB\nendstream",
+				"<< /JBIG2Globals 6 0 R >>",
+			)
+			clean, err := Sanitize(source)
+			if err != nil {
+				t.Fatalf("Sanitize() error = %v", err)
+			}
+			if !bytes.Contains(clean, []byte("GLB")) || !bytes.Contains(clean, []byte("/JBIG2Globals")) {
+				t.Fatal("reconstruction lost the shared JBIG2 globals stream")
+			}
+		})
+	}
+}
+
+func TestSanitizeRejectsOtherReferencesBesideJBIG2Globals(t *testing.T) {
+	source := resourceGraphPDF(t,
+		"<< /XObject << /Im0 5 0 R >> >>",
+		"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 6 0 R /Other 6 0 R >> /Length 1 >>\nstream\n\x00\nendstream",
+		"<< /Length 3 >>\nstream\nGLB\nendstream",
+	)
+	if _, err := Sanitize(source); err == nil || !strings.Contains(err.Error(), "indirect PDF /DecodeParms") {
+		t.Fatalf("Sanitize() error = %v, want rejection", err)
+	}
+}
+
+func TestSanitizeRepairsMissingEOLBeforeEndstream(t *testing.T) {
+	source := resourceGraphPDF(t,
+		"<< /XObject << /Im0 5 0 R >> >>",
+		"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 1 >>\nstream\n\xffendstream",
+	)
+	clean, err := Sanitize(source)
+	if err != nil {
+		t.Fatalf("Sanitize() error = %v", err)
+	}
+	if !bytes.Contains(clean, []byte("\xff\nendstream")) {
+		t.Fatal("reconstructed stream did not gain an end-of-line marker before endstream")
+	}
+	if _, err := Sanitize(clean); err != nil {
+		t.Fatalf("second Sanitize() error = %v", err)
+	}
+}
+
+func TestSanitizeOpensEncryptedSourceWithPassword(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "importpdf", "testdata", "aes-256-user.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeContext(context.Background(), data, Options{}); !errors.Is(err, importpdf.ErrPasswordRequired) {
+		t.Fatalf("without password error = %v, want ErrPasswordRequired", err)
+	}
+	clean, err := SanitizeContext(context.Background(), data, Options{Password: "senha"})
+	if err != nil {
+		t.Fatalf("SanitizeContext() error = %v", err)
+	}
+	if bytes.Contains(clean, []byte("/Encrypt")) {
+		t.Fatal("reconstruction is still encrypted")
+	}
+	if _, err := importpdf.OpenBytes(clean); err != nil {
+		t.Fatalf("reconstruction cannot be imported without a password: %v", err)
 	}
 }
 
@@ -596,7 +713,7 @@ func crossPageResourceRolePDF(t testing.TB) []byte {
 	builder.set(ids[3], []byte("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 7 0 R /Contents 6 0 R >>"))
 	builder.set(ids[4], pdfStreamBody(nil))
 	builder.set(ids[5], pdfStreamBody(nil))
-	builder.set(ids[6], []byte("<< /F1 8 0 R >>"))
+	builder.set(ids[6], []byte("<< /A 8 0 R >>"))
 	builder.set(ids[7], []byte(sharedFontBody))
 	data, err := builder.bytes(context.Background(), 1)
 	if err != nil {
@@ -685,4 +802,53 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func pageGeometryPDF(t testing.TB, pagesExtra, pageExtra string) []byte {
+	t.Helper()
+	builder := &pdfBuilder{}
+	ids := make([]int, 4)
+	for i := range ids {
+		ids[i] = builder.reserve()
+	}
+	builder.set(ids[0], []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	builder.set(ids[1], []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 "+pagesExtra+" >>"))
+	builder.set(ids[2], []byte("<< /Type /Page /Parent 2 0 R "+pageExtra+" /Resources << >> /Contents 4 0 R >>"))
+	builder.set(ids[3], pdfStreamBody([]byte("0 0 m 10 10 l S")))
+	data, err := builder.bytes(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSanitizeKeepsVisiblePageGeometry(t *testing.T) {
+	for name, tc := range map[string]struct {
+		pagesExtra, pageExtra string
+		wantRotate            string
+		wantMediaBox          string
+	}{
+		"inherited rotation": {pagesExtra: "/Rotate 90 /MediaBox [0 0 200 100]", wantRotate: "/Rotate 90", wantMediaBox: "/MediaBox [0 0 200.00000 100.00000]"},
+		"negative rotation":  {pageExtra: "/Rotate -90 /MediaBox [0 0 200 100]", wantRotate: "/Rotate 270", wantMediaBox: "/MediaBox [0 0 200.00000 100.00000]"},
+		"invalid rotation":   {pageExtra: "/Rotate 45 /MediaBox [0 0 200 100]", wantMediaBox: "/MediaBox [0 0 200.00000 100.00000]"},
+		"crop box":           {pageExtra: "/MediaBox [0 0 200 100] /CropBox [10 20 110 70]", wantMediaBox: "/MediaBox [0 0 100.00000 50.00000]"},
+		"crop beyond media":  {pageExtra: "/MediaBox [0 0 200 100] /CropBox [-50 -50 100 300]", wantMediaBox: "/MediaBox [0 0 100.00000 100.00000]"},
+		"inverted media box": {pageExtra: "/MediaBox [200 100 0 0]", wantMediaBox: "/MediaBox [0 0 200.00000 100.00000]"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clean, err := Sanitize(pageGeometryPDF(t, tc.pagesExtra, tc.pageExtra))
+			if err != nil {
+				t.Fatalf("Sanitize() error = %v", err)
+			}
+			if !bytes.Contains(clean, []byte(tc.wantMediaBox)) {
+				t.Fatalf("reconstruction lacks %s:\n%s", tc.wantMediaBox, clean)
+			}
+			if tc.wantRotate == "" && bytes.Contains(clean, []byte("/Rotate")) {
+				t.Fatal("reconstruction rotated a page that has no valid rotation")
+			}
+			if tc.wantRotate != "" && !bytes.Contains(clean, []byte(tc.wantRotate)) {
+				t.Fatalf("reconstruction lacks %s", tc.wantRotate)
+			}
+		})
+	}
 }

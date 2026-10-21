@@ -3,7 +3,10 @@
 PDFRune owns operations whose input is an existing PDF. It never owns document
 authoring, layout, or initial PDF generation.
 
-`importpdf` is the bounded classic-xref parser. `inspect` and `pdfcdr` consume
+`importpdf` is the bounded classic-xref parser. A source that uses
+cross-reference streams, object streams, or standard-handler encryption is
+first rewritten by a bounded normalization pass into an equivalent classic,
+unencrypted PDF, which the same classic parser then reads. `inspect` and `pdfcdr` consume
 that parser. `characterize` and `pdfverify` own post-generation evidence.
 `sign` owns incremental PDF signatures and CMS verification and is independent
 of the parser packages.
