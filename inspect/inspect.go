@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -32,6 +33,8 @@ const (
 	maxTextNestingDepth   = 256
 	maxExtractedTextBytes = 16 * 1024 * 1024
 	textContextCheckBytes = 1024
+	maxPageTreeDepth      = 512
+	maxUserUnit           = 75000
 	pdfOctalBase          = 8
 	utf16BOMBytes         = 2
 )
@@ -74,7 +77,8 @@ func PageCountContext(ctx context.Context, data []byte) (int, error) {
 	return source.PageCount(), nil
 }
 
-// FirstPageSizePoints returns the first MediaBox dimensions in PDF points.
+// FirstPageSizePoints returns the first MediaBox dimensions in PDF points,
+// scaled by the page /UserUnit when present. /Rotate is not applied.
 func FirstPageSizePoints(data []byte) (float64, float64, error) {
 	source, err := importpdf.OpenBytes(data)
 	if err != nil {
@@ -84,17 +88,94 @@ func FirstPageSizePoints(data []byte) (float64, float64, error) {
 	if !ok {
 		return 0, 0, errors.New("pdf MediaBox not found")
 	}
-	return size.Wd, size.Ht, nil
+	unit := firstPageUserUnit(source)
+	return size.Wd * unit, size.Ht * unit, nil
 }
 
-// Text extracts literal text operators from PDF content streams.
+// firstPageUserUnit reads /UserUnit from the first leaf of the page tree.
+// importpdf does not expose page dictionaries, so the catalog is located
+// among the parsed objects; an unreadable or ambiguous tree reads as 1.
+func firstPageUserUnit(source *importpdf.Source) float64 {
+	objects := &pdfResourceObjects{
+		ctx:    context.Background(),
+		bodies: make(map[streamObjectRef][]byte),
+		parsed: make(map[streamObjectRef]pdfObject),
+	}
+	var catalogs []streamObjectRef
+	err := source.ForEachObjectBorrowedContext(context.Background(), func(ref importpdf.ObjRef, body []byte) error {
+		key := streamObjectRef{number: ref.ObjectNumber(), generation: ref.Generation()}
+		objects.bodies[key] = body
+		if bytes.Contains(body, []byte("Catalog")) {
+			catalogs = append(catalogs, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return 1
+	}
+	unit := 0.0
+	for _, ref := range catalogs {
+		catalog := objects.object(ref)
+		if objects.resolve(catalog.get("Type")).name != "Catalog" {
+			continue
+		}
+		page, ok := firstPageObject(objects, catalog.get("Pages"), make(map[streamObjectRef]bool), 0)
+		if !ok {
+			continue
+		}
+		value := pdfObjectNumberOr(objects.resolve(page.get("UserUnit")), 1)
+		if value <= 0 || value > maxUserUnit || math.IsNaN(value) {
+			value = 1
+		}
+		if unit != 0 && unit != value {
+			return 1
+		}
+		unit = value
+	}
+	if unit == 0 {
+		return 1
+	}
+	return unit
+}
+
+func firstPageObject(objects *pdfResourceObjects, node pdfObject, visited map[streamObjectRef]bool, depth int) (pdfObject, bool) {
+	if depth > maxPageTreeDepth {
+		return pdfObject{}, false
+	}
+	if node.kind == pdfObjectRef {
+		if visited[node.ref] {
+			return pdfObject{}, false
+		}
+		visited[node.ref] = true
+	}
+	dict := objects.resolve(node)
+	if dict.kind != pdfObjectDict {
+		return pdfObject{}, false
+	}
+	typeName := objects.resolve(dict.get("Type")).name
+	if _, hasContents := dict.dict["Contents"]; typeName == "Page" || (typeName == "" && hasContents) {
+		return dict, true
+	}
+	kids := objects.resolve(dict.get("Kids"))
+	for _, kid := range kids.array {
+		if page, ok := firstPageObject(objects, kid, visited, depth+1); ok {
+			return page, true
+		}
+	}
+	return pdfObject{}, false
+}
+
+// Text extracts the text shown on every page, decoding strings through their
+// fonts and separating words, lines, and pages by layout.
 func Text(data []byte) (string, error) {
 	return TextContext(context.Background(), data)
 }
 
-// TextContext extracts literal text operators from page content streams and
-// honors ctx during page parsing and text tokenization. Non-page streams such
-// as metadata, fonts, images, and attachments are not treated as document text.
+// TextContext extracts the text shown by page content streams and the Form
+// XObjects they draw, and honors ctx during page parsing and text
+// tokenization. Non-page streams such as metadata, fonts, images, and
+// attachments are not treated as document text. Pages are separated by a
+// line break.
 func TextContext(ctx context.Context, data []byte) (string, error) {
 	if err := inspectContextErr(ctx); err != nil {
 		return "", err
@@ -105,7 +186,8 @@ func TextContext(ctx context.Context, data []byte) (string, error) {
 	}
 
 	var text strings.Builder
-	totalBytes := 0
+	budget := newTextBudget()
+	fonts := make(map[streamObjectRef]*pdfFont)
 	for pageNumber := 1; pageNumber <= source.PageCount(); pageNumber++ {
 		if err := inspectContextErr(ctx); err != nil {
 			return "", err
@@ -121,20 +203,56 @@ func TextContext(ctx context.Context, data []byte) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse pdf page %d: %w", pageNumber, err)
 		}
-		if len(content) > maxDecodedTotalBytes-totalBytes {
+		if len(content) > budget.remaining {
 			return "", errors.New("decoded pdf page contents exceed maximum size")
 		}
-		totalBytes += len(content)
-		streamText, err := textFromContentStreamContext(ctx, content)
+		budget.remaining -= len(content)
+		streamText, err := pageTextFromContentContext(ctx, page, content, budget, fonts)
 		if err != nil {
 			return "", err
 		}
-		if len(streamText) > maxExtractedTextBytes-text.Len() {
-			return "", fmt.Errorf("%w: document text exceeds %d bytes", ErrTextLimitExceeded, maxExtractedTextBytes)
+		if err := appendPageText(&text, streamText); err != nil {
+			return "", err
 		}
-		text.WriteString(streamText)
 	}
 	return text.String(), nil
+}
+
+// appendPageText adds one page's text, starting it on a new line.
+func appendPageText(text *strings.Builder, pageText string) error {
+	if pageText == "" {
+		return nil
+	}
+	separator := 0
+	if text.Len() > 0 && !strings.HasSuffix(text.String(), "\n") {
+		separator = 1
+	}
+	if len(pageText)+separator > maxExtractedTextBytes-text.Len() {
+		return fmt.Errorf("%w: document text exceeds %d bytes", ErrTextLimitExceeded, maxExtractedTextBytes)
+	}
+	if separator > 0 {
+		text.WriteByte('\n')
+	}
+	text.WriteString(pageText)
+	return nil
+}
+
+// pageTextFromContentContext extracts the text of one page content stream
+// with the page resources.
+func pageTextFromContentContext(ctx context.Context, page *importpdf.PageRef, content []byte, budget *textBudget, fonts map[streamObjectRef]*pdfFont) (string, error) {
+	objects := newPDFResourceObjects(ctx, page, budget)
+	resources, _, err := parsePDFObjectOrRef(page.ResourcesBorrowed(), 0, 0)
+	if err != nil {
+		resources = pdfObject{}
+	}
+	extractor := newTextExtractor(ctx, objects, fonts, objects.resolve(resources))
+	if err := extractor.run(content); err != nil {
+		return "", err
+	}
+	if err := inspectContextErr(ctx); err != nil {
+		return "", err
+	}
+	return extractor.out.String(), nil
 }
 
 // PageText extracts text from one importable PDF page.
@@ -167,7 +285,9 @@ func PageTextContext(ctx context.Context, data []byte, pageNum int) (string, err
 	if err != nil {
 		return "", fmt.Errorf("parse pdf page: %w", err)
 	}
-	return textFromContentStreamContext(ctx, content)
+	budget := newTextBudget()
+	budget.remaining -= len(content)
+	return pageTextFromContentContext(ctx, page, content, budget, nil)
 }
 
 // DecodedStreams returns raw or Flate-decoded PDF streams in file order.
@@ -348,15 +468,6 @@ func (r inspectContextReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-type pdfTextToken struct {
-	text   string
-	isText bool
-}
-
-type pdfMarkedContentFrame struct {
-	actualText bool
-}
-
 type pdfTextScanner struct {
 	ctx              context.Context
 	nextContextCheck int
@@ -375,188 +486,6 @@ func (s *pdfTextScanner) check(pos int) error {
 	}
 	s.nextContextCheck = pos + textContextCheckBytes
 	return nil
-}
-
-func textFromContentStreamContext(ctx context.Context, stream []byte) (string, error) {
-	var out strings.Builder
-	scanner := newPDFTextScanner(ctx)
-	tokens := make([]pdfTextToken, 0, textTokenCapacity)
-	markedContent := make([]pdfMarkedContentFrame, 0, textTokenCapacity)
-	inText := false
-	suppressedTextDepth := 0
-	operandCount := 0
-	pendingActualText := false
-	actualText := ""
-	actualTextPresent := false
-
-	resetOperands := func() {
-		tokens = tokens[:0]
-		operandCount = 0
-		pendingActualText = false
-		actualText = ""
-		actualTextPresent = false
-	}
-	addOperand := func(token pdfTextToken) error {
-		operandCount++
-		if operandCount > maxTextOperands {
-			return fmt.Errorf("%w: pending operand count exceeds %d", ErrTextLimitExceeded, maxTextOperands)
-		}
-		if !token.isText {
-			return nil
-		}
-		if len(tokens) < textTokenCapacity {
-			tokens = append(tokens, token)
-			return nil
-		}
-		copy(tokens, tokens[1:])
-		tokens[len(tokens)-1] = token
-		return nil
-	}
-
-	for i := 0; i < len(stream); {
-		if err := scanner.check(i); err != nil {
-			return "", err
-		}
-		var err error
-		i, err = skipPDFWhitespaceAndCommentsContext(scanner, stream, i)
-		if err != nil {
-			return "", err
-		}
-		if i >= len(stream) {
-			break
-		}
-
-		switch stream[i] {
-		case '(':
-			raw, next, err := readPDFLiteralStringContext(scanner, stream, i, maxExtractedTextBytes)
-			if err != nil {
-				return "", err
-			}
-			text := decodePDFTextBytes(raw)
-			if len(text) > maxExtractedTextBytes {
-				return "", fmt.Errorf("%w: text token exceeds %d bytes", ErrTextLimitExceeded, maxExtractedTextBytes)
-			}
-			if pendingActualText {
-				actualText, actualTextPresent = text, true
-			}
-			pendingActualText = false
-			if err := addOperand(pdfTextToken{text: text, isText: true}); err != nil {
-				return "", err
-			}
-			i = next
-		case '<':
-			if i+1 < len(stream) && stream[i+1] == '<' {
-				i += 2
-				continue
-			}
-			raw, next, err := readPDFHexStringContext(scanner, stream, i, maxExtractedTextBytes)
-			if err != nil {
-				return "", err
-			}
-			text := decodePDFTextBytes(raw)
-			if len(text) > maxExtractedTextBytes {
-				return "", fmt.Errorf("%w: text token exceeds %d bytes", ErrTextLimitExceeded, maxExtractedTextBytes)
-			}
-			if pendingActualText {
-				actualText, actualTextPresent = text, true
-			}
-			pendingActualText = false
-			if err := addOperand(pdfTextToken{text: text, isText: true}); err != nil {
-				return "", err
-			}
-			i = next
-		case '[':
-			text, next, err := readPDFArrayTextContext(scanner, stream, i, maxExtractedTextBytes)
-			if err != nil {
-				return "", err
-			}
-			pendingActualText = false
-			if err := addOperand(pdfTextToken{text: text, isText: true}); err != nil {
-				return "", err
-			}
-			i = next
-		case '/':
-			name, next := readPDFName(stream, i)
-			if pendingActualText {
-				pendingActualText = false
-			}
-			if name == "ActualText" {
-				pendingActualText = true
-			}
-			if err := addOperand(pdfTextToken{}); err != nil {
-				return "", err
-			}
-			i = next
-		default:
-			word, next := readPDFWord(stream, i)
-			if word == "" {
-				i++
-				continue
-			}
-
-			if isPDFOperandWord(word) {
-				pendingActualText = false
-				if err := addOperand(pdfTextToken{}); err != nil {
-					return "", err
-				}
-				i = next
-				continue
-			}
-
-			switch word {
-			case "BDC":
-				frame := pdfMarkedContentFrame{actualText: actualTextPresent}
-				if frame.actualText {
-					if suppressedTextDepth == 0 {
-						if err := appendExtractedText(&out, actualText); err != nil {
-							return "", err
-						}
-					}
-					suppressedTextDepth++
-				}
-				if len(markedContent) >= maxTextNestingDepth {
-					return "", fmt.Errorf("%w: marked-content nesting exceeds %d", ErrTextLimitExceeded, maxTextNestingDepth)
-				}
-				markedContent = append(markedContent, frame)
-			case "BMC":
-				if len(markedContent) >= maxTextNestingDepth {
-					return "", fmt.Errorf("%w: marked-content nesting exceeds %d", ErrTextLimitExceeded, maxTextNestingDepth)
-				}
-				markedContent = append(markedContent, pdfMarkedContentFrame{})
-			case "EMC":
-				if len(markedContent) > 0 {
-					frame := markedContent[len(markedContent)-1]
-					markedContent = markedContent[:len(markedContent)-1]
-					if frame.actualText {
-						suppressedTextDepth--
-					}
-				}
-			case "BT":
-				inText = true
-			case "ET":
-				inText = false
-			case "Tj", "'", "\"", "TJ":
-				if inText && suppressedTextDepth == 0 {
-					if err := appendExtractedText(&out, lastTextToken(tokens)); err != nil {
-						return "", err
-					}
-				}
-			case "BI":
-				inlineEnd, err := skipPDFInlineImage(scanner, stream, next)
-				if err != nil {
-					return "", err
-				}
-				next = inlineEnd
-			}
-			resetOperands()
-			i = next
-		}
-	}
-
-	if err := inspectContextErr(ctx); err != nil {
-		return "", err
-	}
-	return out.String(), nil
 }
 
 func appendExtractedText(out *strings.Builder, text string) error {
@@ -616,7 +545,7 @@ func skipPDFInlineImage(scanner *pdfTextScanner, data []byte, pos int) (int, err
 			pos = next
 			wantsLength = false
 		case '[':
-			_, next, err := readPDFArrayTextContext(scanner, data, pos, maxExtractedTextBytes)
+			_, next, err := readPDFArrayOperandContext(scanner, data, pos, maxExtractedTextBytes)
 			if err != nil {
 				return pos, err
 			}
@@ -624,7 +553,7 @@ func skipPDFInlineImage(scanner *pdfTextScanner, data []byte, pos int) (int, err
 			wantsLength = false
 		case '/':
 			name, next := readPDFName(data, pos)
-			wantsLength = name == "Length"
+			wantsLength = name == "Length" || name == "L"
 			pos = next
 		default:
 			word, next := readPDFWord(data, pos)
@@ -709,6 +638,11 @@ func inlineImageContinuationIsPlausible(scanner *pdfTextScanner, data []byte, po
 	if pos >= len(data) {
 		return true, nil
 	}
+	// Operands of the next operator (numbers, names, strings, arrays) are
+	// as plausible as an operator itself.
+	if strings.IndexByte("0123456789-+./(<[", data[pos]) >= 0 {
+		return true, nil
+	}
 	word, _ := readPDFWord(data, pos)
 	if word == "" {
 		return false, nil
@@ -719,18 +653,6 @@ func inlineImageContinuationIsPlausible(scanner *pdfTextScanner, data []byte, po
 	default:
 		return false, nil
 	}
-}
-
-func lastTextToken(tokens []pdfTextToken) string {
-	if len(tokens) == 0 {
-		return ""
-	}
-	for i := len(tokens); i > 0; i-- {
-		if tokens[i-1].isText {
-			return tokens[i-1].text
-		}
-	}
-	return ""
 }
 
 func skipPDFWhitespaceAndComments(data []byte, pos int) int {
@@ -806,88 +728,9 @@ func isPDFWhitespace(c byte) bool {
 	}
 }
 
-func readPDFArrayTextContext(scanner *pdfTextScanner, data []byte, pos, maxBytes int) (string, int, error) {
-	var out strings.Builder
-	pos++
-	depth := 1
-	elements := 0
-
-	for pos < len(data) && depth > 0 {
-		if err := scanner.check(pos); err != nil {
-			return "", pos, err
-		}
-		var err error
-		pos, err = skipPDFWhitespaceAndCommentsContext(scanner, data, pos)
-		if err != nil {
-			return "", pos, err
-		}
-		if pos >= len(data) {
-			break
-		}
-
-		switch data[pos] {
-		case '[':
-			depth++
-			if depth > maxTextNestingDepth {
-				return "", pos, fmt.Errorf("%w: array nesting exceeds %d", ErrTextLimitExceeded, maxTextNestingDepth)
-			}
-			elements++
-			pos++
-		case ']':
-			depth--
-			pos++
-		case '(':
-			raw, next, err := readPDFLiteralStringContext(scanner, data, pos, maxBytes)
-			if err != nil {
-				return "", pos, err
-			}
-			if err := appendArrayText(&out, decodePDFTextBytes(raw), maxBytes); err != nil {
-				return "", pos, err
-			}
-			elements++
-			pos = next
-		case '<':
-			if pos+1 < len(data) && data[pos+1] == '<' {
-				pos += 2
-				continue
-			}
-			raw, next, err := readPDFHexStringContext(scanner, data, pos, maxBytes)
-			if err != nil {
-				return "", pos, err
-			}
-			if err := appendArrayText(&out, decodePDFTextBytes(raw), maxBytes); err != nil {
-				return "", pos, err
-			}
-			elements++
-			pos = next
-		default:
-			_, next := readPDFWord(data, pos)
-			elements++
-			if next <= pos {
-				pos++
-			} else {
-				pos = next
-			}
-		}
-		if elements > maxTextArrayElements {
-			return "", pos, fmt.Errorf("%w: array element count exceeds %d", ErrTextLimitExceeded, maxTextArrayElements)
-		}
-	}
-
-	return out.String(), pos, nil
-}
-
 func readPDFLiteralString(data []byte, pos int) ([]byte, int) {
 	raw, next, _ := readPDFLiteralStringContext(newPDFTextScanner(context.Background()), data, pos, len(data))
 	return raw, next
-}
-
-func appendArrayText(out *strings.Builder, text string, maxBytes int) error {
-	if len(text) > maxBytes-out.Len() {
-		return fmt.Errorf("%w: array text exceeds %d bytes", ErrTextLimitExceeded, maxBytes)
-	}
-	out.WriteString(text)
-	return nil
 }
 
 func readPDFLiteralStringContext(scanner *pdfTextScanner, data []byte, pos, maxBytes int) ([]byte, int, error) {
@@ -969,7 +812,13 @@ func readPDFHexString(data []byte, pos int) ([]byte, int) {
 
 func readPDFHexStringContext(scanner *pdfTextScanner, data []byte, pos, maxBytes int) ([]byte, int, error) {
 	pos++
-	hexText := make([]byte, 0, min(len(data)-pos, maxBytes*2))
+	// Size the buffer by this string, not by the rest of the stream, so a
+	// stream of many short hex strings allocates linearly.
+	end := bytes.IndexByte(data[min(pos, len(data)):], '>')
+	if end < 0 {
+		end = len(data) - pos
+	}
+	hexText := make([]byte, 0, max(0, min(end, maxBytes*2)))
 	for pos < len(data) && data[pos] != '>' {
 		if err := scanner.check(pos); err != nil {
 			return nil, pos, err

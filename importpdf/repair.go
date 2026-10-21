@@ -215,6 +215,14 @@ func reconstructSourceContext(ctx context.Context, data []byte, options ImportOp
 		trailer["Root"] = pdfValue{kind: pdfValueRef, ref: catalog, raw: []byte(fmt.Sprintf("%d %d R", catalog.num, catalog.gen))}
 	}
 
+	// The rebuilt table has one row per object number up to the largest, so a
+	// number past the entry limit (one header can name 300000000000) is left
+	// out instead of sizing that table.
+	for number := range latest {
+		if number >= MaxXrefEntries {
+			delete(latest, number)
+		}
+	}
 	numbers := make([]int, 0, len(latest))
 	for number := range latest {
 		numbers = append(numbers, number)

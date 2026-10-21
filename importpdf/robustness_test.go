@@ -435,3 +435,14 @@ func TestReconstructionKeepsTheLatestRevision(t *testing.T) {
 		}
 	}
 }
+
+func TestReconstructionIgnoresHugeObjectNumbers(t *testing.T) {
+	data := []byte("%PDF-1.4\n300000000000 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _ = OpenBytes(data)
+	runtime.ReadMemStats(&after)
+	if after.TotalAlloc-before.TotalAlloc > 64<<20 {
+		t.Fatalf("reconstruction allocated %d MB", (after.TotalAlloc-before.TotalAlloc)>>20)
+	}
+}

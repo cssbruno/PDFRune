@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- `inspect.Text` decodes shown strings through their fonts: `/ToUnicode` CMaps
+  (1–4 byte codes, bfchar/bfrange, surrogate pairs, ligatures), Type0
+  Identity-H/V (codes without a mapping produce no text), and simple-font
+  encodings (WinAnsi, MacRoman, Standard, Symbol, `/Differences` through the
+  Adobe Glyph List). Text drawn by Form XObjects is included, bounded in depth
+  and by the shared decoded-byte budget. Text from Chrome, LibreOffice,
+  Ghostscript and pypdf output was unreadable before.
+- `inspect.Text` separates words, lines, and pages by layout (baseline
+  changes, gaps from glyph widths, standard 14 Helvetica and Courier metrics
+  when `/Widths` is absent, TJ adjustments of -200 or less), so adjacent values
+  such as "13,5" and "14,0" no longer fuse.
+- `inspect` sizes hexadecimal-string buffers by the string, not the rest of
+  the stream (a 2 MB stream took 13 s); an inline image followed by an operand
+  or using `/L` no longer fails the document, and a broken inline image ends
+  only its content stream.
+- `inspect.FirstPageSizePoints` applies the page `/UserUnit` (`/Rotate` is
+  still not applied).
+- `importpdf` repair leaves out object numbers past `MaxXrefEntries`, which
+  made a 133-byte file allocate about 1.9 GB.
 - `sign` writes non-ASCII signature dictionary text (`/Name`, `/Reason`,
   `/Location`, `/ContactInfo`, field `/T`) as UTF-16BE instead of `?`.
 - `sign` verification and extraction read cross-reference streams, hybrid

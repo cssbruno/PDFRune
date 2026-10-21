@@ -28,7 +28,9 @@ func FuzzDecodedStreamsAndText(f *testing.F) {
 			if err != nil {
 				t.Fatalf("Text succeeded but PageText(%d) failed: %v", page, err)
 			}
-			pageText.WriteString(text)
+			if err := appendPageText(&pageText, text); err != nil {
+				t.Fatalf("appendPageText(%d) failed: %v", page, err)
+			}
 		}
 		if text != pageText.String() {
 			t.Fatalf("Text = %q, concatenated PageText = %q", text, pageText.String())
