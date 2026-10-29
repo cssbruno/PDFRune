@@ -147,6 +147,10 @@ func Build(ctx context.Context, artifacts []Artifact, command string, fingerprin
 		}
 		total += uint64(len(artifact.PDF))
 	}
+	// The report holds each fixture's text twice (Text and PageText), so it
+	// exceeds MaxJSONBytes as soon as the text so far does; checking only the
+	// final JSON kept every fixture's text first.
+	var reportText uint64
 	for _, artifact := range ordered {
 		if err := ctx.Err(); err != nil {
 			return Report{}, err
@@ -154,6 +158,10 @@ func Build(ctx context.Context, artifacts []Artifact, command string, fingerprin
 		evidence, err := inspectArtifact(ctx, artifact, limits.MaxTextBytes)
 		if err != nil {
 			return Report{}, fmt.Errorf("characterize %q: %w", artifact.Name, err)
+		}
+		reportText += 2 * uint64(len(evidence.Text))
+		if reportText > limits.MaxJSONBytes {
+			return Report{}, ErrLimit
 		}
 		report.Fixtures = append(report.Fixtures, evidence)
 	}
@@ -164,18 +172,19 @@ func Build(ctx context.Context, artifacts []Artifact, command string, fingerprin
 }
 
 func inspectArtifact(ctx context.Context, artifact Artifact, maxText uint64) (FixtureEvidence, error) {
-	pages, err := inspect.PageCountContext(ctx, artifact.PDF)
-	if err != nil || pages <= 0 || uint64(pages) > uint64(^uint32(0)) {
-		return FixtureEvidence{}, fmt.Errorf("page count: %w", err)
+	// One parse and one decode budget for the document: per-page calls
+	// reopened the file and decoded shared content with a fresh budget each.
+	pageText, err := inspect.PagesTextContext(ctx, artifact.PDF)
+	if err != nil {
+		return FixtureEvidence{}, fmt.Errorf("text: %w", err)
 	}
-	pageText := make([]string, pages)
+	pages := len(pageText)
+	if pages <= 0 || uint64(pages) > uint64(^uint32(0)) {
+		return FixtureEvidence{}, errors.New("page count: pdf has no pages")
+	}
 	var text strings.Builder
 	for page := 1; page <= pages; page++ {
-		value, err := inspect.PageTextContext(ctx, artifact.PDF, page)
-		if err != nil {
-			return FixtureEvidence{}, fmt.Errorf("page %d text: %w", page, err)
-		}
-		value = normalizeExtractedText(value)
+		value := normalizeExtractedText(pageText[page-1])
 		if uint64(text.Len()+len(value)) > maxText { // #nosec G115 -- collection length is bounded by the surrounding limit or container invariant
 			return FixtureEvidence{}, ErrLimit
 		}

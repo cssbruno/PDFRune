@@ -8,12 +8,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/cssbruno/pdfrune/importpdf"
 	"github.com/cssbruno/pdfrune/inspect"
 )
 
@@ -75,23 +77,29 @@ type parsedTagNode struct {
 }
 
 var (
-	tagObjectHeader = regexp.MustCompile(`(?m)(?:^|\r?\n)([1-9][0-9]*)[ \t]+0[ \t]+obj(?:[ \t]*\r?\n|[ \t]+)`)
-	tagRootType     = regexp.MustCompile(`/Type[ \t\r\n]*/StructTreeRoot\b`)
-	tagElementType  = regexp.MustCompile(`/Type[ \t\r\n]*/StructElem\b`)
-	tagRole         = regexp.MustCompile(`/S[ \t\r\n]*/([A-Za-z0-9]+)\b`)
-	tagParent       = regexp.MustCompile(`/P[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
-	tagPage         = regexp.MustCompile(`/Pg[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
-	tagRootKid      = regexp.MustCompile(`/K[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
-	tagParentTree   = regexp.MustCompile(`/ParentTree[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
-	tagMCID         = regexp.MustCompile(`/MCID[ \t\r\n]+[0-9]+\b`)
-	tagAlt          = regexp.MustCompile(`/Alt\b`)
-	tagActualText   = regexp.MustCompile(`/ActualText\b`)
-	tagLanguage     = regexp.MustCompile(`/Lang\b`)
+	tagRootType    = regexp.MustCompile(`/Type[ \t\r\n]*/StructTreeRoot\b`)
+	tagElementType = regexp.MustCompile(`/Type[ \t\r\n]*/StructElem\b`)
+	tagRole        = regexp.MustCompile(`/S[ \t\r\n]*/([A-Za-z0-9]+)\b`)
+	tagParent      = regexp.MustCompile(`/P[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagPage        = regexp.MustCompile(`/Pg[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagRootKid     = regexp.MustCompile(`/K[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagParentTree  = regexp.MustCompile(`/ParentTree[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagMCID        = regexp.MustCompile(`/MCID[ \t\r\n]+[0-9]+\b`)
+	tagAlt         = regexp.MustCompile(`/Alt\b`)
+	tagActualText  = regexp.MustCompile(`/ActualText\b`)
+	tagLanguage    = regexp.MustCompile(`/Lang\b`)
+	tagStructRoot  = regexp.MustCompile(`/StructTreeRoot[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagMarkInfo    = regexp.MustCompile(`/MarkInfo[ \t\r\n]*<<[^>]*/Marked[ \t\r\n]+true\b`)
+	tagMarkInfoRef = regexp.MustCompile(`/MarkInfo[ \t\r\n]+([1-9][0-9]*)[ \t\r\n]+0[ \t\r\n]+R\b`)
+	tagMarkedTrue  = regexp.MustCompile(`/Marked[ \t\r\n]+true\b`)
 )
 
-// InspectTags independently inspects the committed classic-PDF bytes. It does
-// not consume layout-plan semantics and therefore cannot invent a tag that is
-// absent from the serialized structure tree.
+// InspectTags independently inspects the committed PDF bytes. It does not
+// consume layout-plan semantics and therefore cannot invent a tag that is
+// absent from the serialized structure tree: objects come from the parsed
+// cross-reference data, not from text that looks like an object (inside a
+// stream, say), and /MarkInfo and the structure-tree root are read from the
+// catalog the trailer names.
 func InspectTags(ctx context.Context, pdf []byte, limits TagInspectionLimits) (TagReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -106,24 +114,28 @@ func InspectTags(ctx context.Context, pdf []byte, limits TagInspectionLimits) (T
 		return TagReport{}, err
 	}
 	digest := sha256.Sum256(pdf)
-	report := TagReport{Version: TagReportVersion, PDFSHA256: hex.EncodeToString(digest[:]),
-		Marked: bytes.Contains(pdf, []byte("/MarkInfo")) && bytes.Contains(pdf, []byte("/Marked true"))}
-	objects, err := scanTagObjects(ctx, pdf, limits.MaxNodes+16)
+	report := TagReport{Version: TagReportVersion, PDFSHA256: hex.EncodeToString(digest[:])}
+	objects, root, err := parsedTagObjects(ctx, pdf, limits.MaxNodes+16)
 	if err != nil {
 		return TagReport{}, err
 	}
 	objectByNumber := make(map[uint32]tagObject, len(objects))
-	nodes := make(map[uint32]*parsedTagNode)
 	for _, object := range objects {
 		objectByNumber[object.number] = object
-		dictionary := object.body
-		if marker := bytes.Index(dictionary, []byte("\nstream")); marker >= 0 {
-			dictionary = dictionary[:marker]
-		}
+	}
+	catalog := tagDictionary(objectByNumber[root].body)
+	report.Marked = tagMarkInfo.Match(catalog)
+	if markInfo := firstTagReference(tagMarkInfoRef, catalog); markInfo != 0 {
+		report.Marked = tagMarkedTrue.Match(tagDictionary(objectByNumber[markInfo].body))
+	}
+	catalogRoot := firstTagReference(tagStructRoot, catalog)
+	nodes := make(map[uint32]*parsedTagNode)
+	for _, object := range objects {
+		dictionary := tagDictionary(object.body)
 		switch {
 		case tagRootType.Match(dictionary):
-			if report.StructureRoot != 0 {
-				report.Failures = append(report.Failures, "multiple structure-tree roots")
+			// Only the root the catalog names is the document's tree.
+			if object.number != catalogRoot {
 				continue
 			}
 			report.StructureRoot = object.number
@@ -252,39 +264,43 @@ func isPDFOperatorSpace(value byte) bool {
 	}
 }
 
-func scanTagObjects(ctx context.Context, pdf []byte, max uint32) ([]tagObject, error) {
-	matches := tagObjectHeader.FindAllSubmatchIndex(pdf, -1)
-	if uint32(len(matches)) > max { // #nosec G115 -- the regex match count is compared to the caller's bounded limit.
-		return nil, ErrLimit
+// parsedTagObjects returns the in-use generation-0 objects of pdf as the
+// cross-reference data defines them, and the catalog's object number.
+func parsedTagObjects(ctx context.Context, pdf []byte, max uint32) ([]tagObject, uint32, error) {
+	source, err := importpdf.OpenBytesWithOptionsContext(ctx, pdf, importpdf.ImportOptions{})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+		return nil, 0, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
-	objects := make([]tagObject, 0, len(matches))
-	seen := make(map[uint32]struct{}, len(matches))
-	for index, match := range matches {
-		if index&255 == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
+	var objects []tagObject
+	err = source.ForEachObjectBorrowedContext(ctx, func(ref importpdf.ObjRef, body []byte) error {
+		if ref.Generation() != 0 || ref.ObjectNumber() <= 0 || uint64(ref.ObjectNumber()) > uint64(^uint32(0)) {
+			return nil
 		}
-		number64, err := strconv.ParseUint(string(pdf[match[2]:match[3]]), 10, 32)
-		if err != nil || number64 == 0 {
-			return nil, ErrInvalid
+		if uint32(len(objects)) >= max { // #nosec G115 -- objects are appended only after this bound check.
+			return ErrLimit
 		}
-		number := uint32(number64)
-		if _, duplicate := seen[number]; duplicate {
-			return nil, ErrInvalid
-		}
-		seen[number] = struct{}{}
-		end := len(pdf)
-		if index+1 < len(matches) {
-			end = matches[index+1][0]
-		}
-		body := pdf[match[1]:end]
-		if marker := bytes.LastIndex(body, []byte("endobj")); marker >= 0 {
-			body = body[:marker]
-		}
-		objects = append(objects, tagObject{number: number, body: body})
+		objects = append(objects, tagObject{number: uint32(ref.ObjectNumber()), body: body}) // #nosec G115 -- checked against the uint32 range above.
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-	return objects, nil
+	root := source.Root()
+	if root.Generation() != 0 || root.ObjectNumber() <= 0 || uint64(root.ObjectNumber()) > uint64(^uint32(0)) {
+		return objects, 0, nil
+	}
+	return objects, uint32(root.ObjectNumber()), nil // #nosec G115 -- checked against the uint32 range above.
+}
+
+// tagDictionary returns the dictionary part of an object body.
+func tagDictionary(body []byte) []byte {
+	if marker := bytes.Index(body, []byte("stream")); marker >= 0 {
+		return body[:marker]
+	}
+	return body
 }
 
 func firstTagReference(pattern *regexp.Regexp, body []byte) uint32 {

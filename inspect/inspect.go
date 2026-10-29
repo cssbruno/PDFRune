@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -33,8 +32,6 @@ const (
 	maxTextNestingDepth   = 256
 	maxExtractedTextBytes = 16 * 1024 * 1024
 	textContextCheckBytes = 1024
-	maxPageTreeDepth      = 512
-	maxUserUnit           = 75000
 	pdfOctalBase          = 8
 	utf16BOMBytes         = 2
 )
@@ -80,7 +77,14 @@ func PageCountContext(ctx context.Context, data []byte) (int, error) {
 // FirstPageSizePoints returns the first MediaBox dimensions in PDF points,
 // scaled by the page /UserUnit when present. /Rotate is not applied.
 func FirstPageSizePoints(data []byte) (float64, float64, error) {
-	source, err := importpdf.OpenBytes(data)
+	return FirstPageSizePointsContext(context.Background(), data)
+}
+
+// FirstPageSizePointsContext is FirstPageSizePoints honoring ctx while the
+// page tree is imported. The page is the first one reached from the trailer
+// /Root; other catalog objects in the file are ignored.
+func FirstPageSizePointsContext(ctx context.Context, data []byte) (float64, float64, error) {
+	source, err := importpdf.OpenBytesWithOptionsContext(ctx, data, importpdf.ImportOptions{})
 	if err != nil {
 		return 0, 0, fmt.Errorf("parse pdf: %w", err)
 	}
@@ -88,81 +92,8 @@ func FirstPageSizePoints(data []byte) (float64, float64, error) {
 	if !ok {
 		return 0, 0, errors.New("pdf MediaBox not found")
 	}
-	unit := firstPageUserUnit(source)
+	unit := source.PageUserUnit(1)
 	return size.Wd * unit, size.Ht * unit, nil
-}
-
-// firstPageUserUnit reads /UserUnit from the first leaf of the page tree.
-// importpdf does not expose page dictionaries, so the catalog is located
-// among the parsed objects; an unreadable or ambiguous tree reads as 1.
-func firstPageUserUnit(source *importpdf.Source) float64 {
-	objects := &pdfResourceObjects{
-		ctx:    context.Background(),
-		bodies: make(map[streamObjectRef][]byte),
-		parsed: make(map[streamObjectRef]pdfObject),
-	}
-	var catalogs []streamObjectRef
-	err := source.ForEachObjectBorrowedContext(context.Background(), func(ref importpdf.ObjRef, body []byte) error {
-		key := streamObjectRef{number: ref.ObjectNumber(), generation: ref.Generation()}
-		objects.bodies[key] = body
-		if bytes.Contains(body, []byte("Catalog")) {
-			catalogs = append(catalogs, key)
-		}
-		return nil
-	})
-	if err != nil {
-		return 1
-	}
-	unit := 0.0
-	for _, ref := range catalogs {
-		catalog := objects.object(ref)
-		if objects.resolve(catalog.get("Type")).name != "Catalog" {
-			continue
-		}
-		page, ok := firstPageObject(objects, catalog.get("Pages"), make(map[streamObjectRef]bool), 0)
-		if !ok {
-			continue
-		}
-		value := pdfObjectNumberOr(objects.resolve(page.get("UserUnit")), 1)
-		if value <= 0 || value > maxUserUnit || math.IsNaN(value) {
-			value = 1
-		}
-		if unit != 0 && unit != value {
-			return 1
-		}
-		unit = value
-	}
-	if unit == 0 {
-		return 1
-	}
-	return unit
-}
-
-func firstPageObject(objects *pdfResourceObjects, node pdfObject, visited map[streamObjectRef]bool, depth int) (pdfObject, bool) {
-	if depth > maxPageTreeDepth {
-		return pdfObject{}, false
-	}
-	if node.kind == pdfObjectRef {
-		if visited[node.ref] {
-			return pdfObject{}, false
-		}
-		visited[node.ref] = true
-	}
-	dict := objects.resolve(node)
-	if dict.kind != pdfObjectDict {
-		return pdfObject{}, false
-	}
-	typeName := objects.resolve(dict.get("Type")).name
-	if _, hasContents := dict.dict["Contents"]; typeName == "Page" || (typeName == "" && hasContents) {
-		return dict, true
-	}
-	kids := objects.resolve(dict.get("Kids"))
-	for _, kid := range kids.array {
-		if page, ok := firstPageObject(objects, kid, visited, depth+1); ok {
-			return page, true
-		}
-	}
-	return pdfObject{}, false
 }
 
 // Text extracts the text shown on every page, decoding strings through their
@@ -177,45 +108,74 @@ func Text(data []byte) (string, error) {
 // attachments are not treated as document text. Pages are separated by a
 // line break.
 func TextContext(ctx context.Context, data []byte) (string, error) {
-	if err := inspectContextErr(ctx); err != nil {
+	var text strings.Builder
+	if err := eachPageText(ctx, data, func(pageText string) error {
+		return appendPageText(&text, pageText)
+	}); err != nil {
 		return "", err
+	}
+	return text.String(), nil
+}
+
+// PagesTextContext returns the text of every page, in page order, extracted
+// as TextContext does: one parse of data, one decoded-byte budget and one
+// font cache for the whole document, so pages sharing content are not
+// decoded again from a fresh budget as separate PageTextContext calls are.
+// The texts together are limited to the TextContext output size.
+func PagesTextContext(ctx context.Context, data []byte) ([]string, error) {
+	var pages []string
+	total := 0
+	if err := eachPageText(ctx, data, func(pageText string) error {
+		if len(pageText) > maxExtractedTextBytes-total {
+			return fmt.Errorf("%w: extracted text exceeds %d bytes", ErrTextLimitExceeded, maxExtractedTextBytes)
+		}
+		total += len(pageText)
+		pages = append(pages, pageText)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return pages, nil
+}
+
+func eachPageText(ctx context.Context, data []byte, each func(string) error) error {
+	if err := inspectContextErr(ctx); err != nil {
+		return err
 	}
 	source, err := importpdf.OpenBytesWithOptionsContext(ctx, data, importpdf.ImportOptions{})
 	if err != nil {
-		return "", fmt.Errorf("parse pdf text: %w", err)
+		return fmt.Errorf("parse pdf text: %w", err)
 	}
-
-	var text strings.Builder
 	budget := newTextBudget()
 	fonts := make(map[streamObjectRef]*pdfFont)
 	for pageNumber := 1; pageNumber <= source.PageCount(); pageNumber++ {
 		if err := inspectContextErr(ctx); err != nil {
-			return "", err
+			return err
 		}
 		if pageNumber > maxDecodedStreamCount {
-			return "", errors.New("pdf page content stream count exceeds maximum size")
+			return errors.New("pdf page content stream count exceeds maximum size")
 		}
 		page, err := source.PageContext(ctx, pageNumber, "MediaBox")
 		if err != nil {
-			return "", fmt.Errorf("parse pdf page %d: %w", pageNumber, err)
+			return fmt.Errorf("parse pdf page %d: %w", pageNumber, err)
 		}
 		content, err := page.ContentBorrowedWithContext(ctx)
 		if err != nil {
-			return "", fmt.Errorf("parse pdf page %d: %w", pageNumber, err)
+			return fmt.Errorf("parse pdf page %d: %w", pageNumber, err)
 		}
 		if len(content) > budget.remaining {
-			return "", errors.New("decoded pdf page contents exceed maximum size")
+			return errors.New("decoded pdf page contents exceed maximum size")
 		}
 		budget.remaining -= len(content)
 		streamText, err := pageTextFromContentContext(ctx, page, content, budget, fonts)
 		if err != nil {
-			return "", err
+			return err
 		}
-		if err := appendPageText(&text, streamText); err != nil {
-			return "", err
+		if err := each(streamText); err != nil {
+			return err
 		}
 	}
-	return text.String(), nil
+	return nil
 }
 
 // appendPageText adds one page's text, starting it on a new line.

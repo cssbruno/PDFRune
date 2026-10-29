@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ObjRef struct {
@@ -230,9 +231,12 @@ func (p *PageRef) ensureContentContext(ctx context.Context) error {
 		wait := p.contentWait
 		p.contentMu.Unlock()
 
-		p.source.mu.Lock()
-		content, err := p.source.pageContentContext(ctx, p.sourcePage)
-		p.source.mu.Unlock()
+		var content []byte
+		err := p.source.lockContext(ctx)
+		if err == nil {
+			content, err = p.source.pageContentContext(ctx, p.sourcePage)
+			p.source.mu.Unlock()
+		}
 
 		p.contentMu.Lock()
 		if err == nil {
@@ -411,6 +415,32 @@ type Source struct {
 	// readerAtCached counts the body bytes cached from readerAt; caching stops
 	// once they reach the source size, which overlapping spans can exceed.
 	readerAtCached int
+	// refs caches the references each object body makes, so pages sharing a
+	// font or image do not parse it again for every page.
+	refs map[ObjRef][]ObjRef
+}
+
+// lockContext takes doc.mu, giving up when ctx ends: another goroutine may
+// hold the lock for a long page of a shared Source.
+func (doc *Source) lockContext(ctx context.Context) error {
+	if err := importContextErr(ctx); err != nil {
+		return err
+	}
+	if doc.mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return importContextErr(ctx)
+		case <-ticker.C:
+			if doc.mu.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 // ForEachObjectBorrowedContext calls fn for every in-use classic-xref object
@@ -422,10 +452,9 @@ func (doc *Source) ForEachObjectBorrowedContext(ctx context.Context, fn func(Obj
 	if doc == nil || fn == nil {
 		return nil
 	}
-	if err := importContextErr(ctx); err != nil {
+	if err := doc.lockContext(ctx); err != nil {
 		return err
 	}
-	doc.mu.Lock()
 	refs := make([]ObjRef, 0, len(doc.offsets))
 	for ref := range doc.offsets {
 		refs = append(refs, ref)
@@ -479,6 +508,29 @@ type sourcePage struct {
 	boxes     map[string]pdfValue
 	contents  pdfValue
 	rotation  int
+	userUnit  float64
+}
+
+// maxPageUserUnit is the largest /UserUnit accepted; larger values read as 1.
+const maxPageUserUnit = 75000
+
+// Root returns the reference of the catalog named by the trailer /Root.
+func (doc *Source) Root() ObjRef {
+	if doc == nil {
+		return ObjRef{}
+	}
+	return doc.root
+}
+
+// PageUserUnit returns the /UserUnit of page pageNo (1-based), the size of
+// one default user space unit in multiples of 1/72 inch: 1 when the page has
+// none, the value is not a positive number up to 75000, or pageNo is out of
+// range.
+func (doc *Source) PageUserUnit(pageNo int) float64 {
+	if doc == nil || pageNo < 1 || pageNo > len(doc.pages) || doc.pages[pageNo-1].userUnit == 0 {
+		return 1
+	}
+	return doc.pages[pageNo-1].userUnit
 }
 
 const (
@@ -1107,6 +1159,15 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 		if len(doc.pages) >= MaxPages {
 			return errors.New("PDF page count exceeds maximum size")
 		}
+		userUnit := 0.0
+		if value, ok := dict["UserUnit"]; ok {
+			if value, err = doc.resolvePDFValueContext(ctx, value); err != nil {
+				return err
+			}
+			if value.kind == pdfValueNumber && value.number > 0 && value.number <= maxPageUserUnit {
+				userUnit = value.number
+			}
+		}
 		pageBoxes := make(map[string]pdfValue, len(nextInherited.boxes))
 		for k, v := range nextInherited.boxes {
 			pageBoxes[k] = v
@@ -1117,6 +1178,7 @@ func (doc *Source) walkPageTreeContext(ctx context.Context, ref ObjRef, inherite
 			boxes:     pageBoxes,
 			contents:  contents,
 			rotation:  normalizedPDFRotation(nextInherited.rotate),
+			userUnit:  userUnit,
 		})
 		return nil
 	}
@@ -1209,7 +1271,9 @@ func (doc *Source) PageContext(ctx context.Context, pageNo int, boxName string) 
 	if err := importContextErr(ctx); err != nil {
 		return nil, err
 	}
-	doc.mu.Lock()
+	if err := doc.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer doc.mu.Unlock()
 	if err := importContextErr(ctx); err != nil {
 		return nil, err
@@ -1395,30 +1459,55 @@ func (doc *Source) collectReferencedObjectsContext(ctx context.Context, data []b
 		if err := importContextErr(ctx); err != nil {
 			return err
 		}
-		if _, ok := objects[ref]; ok {
-			continue
-		}
-		if visiting[ref] {
-			continue
-		}
-		if limit := doc.maxReferencedObjects(); limit > 0 && len(objects) >= limit {
-			return errors.New("PDF referenced object count exceeds maximum size")
-		}
-		visiting[ref] = true
-		body, err := doc.objectBodyContext(ctx, ref)
-		if err != nil {
+		if err := doc.collectReferencedObjectContext(ctx, ref, objects, visiting, budget); err != nil {
 			return err
 		}
-		if len(body) > *budget {
-			return errors.New("PDF referenced objects exceed the source size")
-		}
-		*budget -= len(body)
-		objects[ref] = append([]byte(nil), body...)
-		if err := doc.collectReferencedObjectsContext(ctx, pdfObjectReferenceSection(body), objects, visiting, budget); err != nil {
-			return err
-		}
-		visiting[ref] = false
 	}
+	return nil
+}
+
+func (doc *Source) collectReferencedObjectContext(ctx context.Context, ref ObjRef, objects map[ObjRef][]byte, visiting map[ObjRef]bool, budget *int) error {
+	if _, ok := objects[ref]; ok {
+		return nil
+	}
+	if visiting[ref] {
+		return nil
+	}
+	if limit := doc.maxReferencedObjects(); limit > 0 && len(objects) >= limit {
+		return errors.New("PDF referenced object count exceeds maximum size")
+	}
+	visiting[ref] = true
+	body, err := doc.objectBodyContext(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if len(body) > *budget {
+		return errors.New("PDF referenced objects exceed the source size")
+	}
+	*budget -= len(body)
+	// Cached bodies never change, and PageRef hands them out as borrowed
+	// or copies them, so the page shares them instead of copying each.
+	objects[ref] = body
+	children, cached := doc.refs[ref]
+	if !cached {
+		children = refsInPDFValueBytesContext(ctx, pdfObjectReferenceSection(body))
+		if err := importContextErr(ctx); err != nil {
+			return err
+		}
+		if doc.refs == nil {
+			doc.refs = make(map[ObjRef][]ObjRef)
+		}
+		doc.refs[ref] = children
+	}
+	for _, child := range children {
+		if err := importContextErr(ctx); err != nil {
+			return err
+		}
+		if err := doc.collectReferencedObjectContext(ctx, child, objects, visiting, budget); err != nil {
+			return err
+		}
+	}
+	visiting[ref] = false
 	return nil
 }
 

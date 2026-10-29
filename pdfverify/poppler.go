@@ -29,7 +29,7 @@ func (r PopplerRasterizer) Rasterize(ctx context.Context, pdf []byte, dpi uint32
 	versionOutput.remaining = 64 << 10
 	versionCommand := exec.CommandContext(ctx, r.Binary, "-v") // #nosec G204 -- executable path is an explicit trusted verifier configuration; no shell is used.
 	versionCommand.Stdout, versionCommand.Stderr = &versionOutput, &versionOutput
-	if err := versionCommand.Run(); err != nil || !strings.Contains(versionOutput.String(), "pdftoppm version "+r.Version) {
+	if err := versionCommand.Run(); err != nil || popplerVersion(versionOutput.String()) != r.Version {
 		return RasterOutput{}, fmt.Errorf("pdftoppm version does not match pinned %q", r.Version)
 	}
 	root, err := os.MkdirTemp(r.TempRoot, "paperrune-pdfverify-")
@@ -72,6 +72,20 @@ func (r PopplerRasterizer) Rasterize(ctx context.Context, pdf []byte, dpi uint32
 		output.Pages[index] = data
 	}
 	return output, nil
+}
+
+// popplerVersion returns the version from a "pdftoppm version X" line, or ""
+// when there is none. The pin must equal it: a substring test let "24.0"
+// accept 24.02.0 and record the pin instead of the binary used.
+func popplerVersion(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "pdftoppm version "); ok {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+	return ""
 }
 
 type boundedBuffer struct {

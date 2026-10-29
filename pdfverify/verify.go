@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cssbruno/pdfrune/characterize"
+	"github.com/cssbruno/pdfrune/inspect"
 )
 
 const ReportVersion uint16 = 1
@@ -195,6 +196,11 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 	report := Report{Version: ReportVersion, PlanHash: request.PlanHash, DPI: request.DPI}
 	pdfHash := sha256.Sum256(request.PDF)
 	report.PDFSHA256 = hex.EncodeToString(pdfHash[:])
+	// Characterization extracts every page's text, so the page limit is
+	// applied to the PDF itself first, not only to the expected pages.
+	if pages, err := inspect.PageCountContext(ctx, request.PDF); err == nil && uint64(pages) > uint64(limits.MaxPages) {
+		return Report{}, ErrLimit
+	}
 	characterizeDefaults := characterize.DefaultLimits()
 	maxText := min(limits.MaxPDFBytes, characterizeDefaults.MaxTextBytes)
 	characterization, err := characterize.Build(ctx, []characterize.Artifact{{Name: "final.pdf", PDF: request.PDF}}, "pdfverify final serialized bytes", characterize.Fingerprint{GOOS: "detached", GOARCH: "detached", GoVersion: "detached", CPUs: 1}, characterize.Limits{MaxFixtures: 1, MaxPDFBytes: limits.MaxPDFBytes, MaxTotalBytes: limits.MaxPDFBytes, MaxTextBytes: maxText, MaxNameBytes: 4096, MaxJSONBytes: limits.MaxJSONBytes})
@@ -208,8 +214,9 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 	if report.PageCount != uint32(len(request.ExpectedPages)) { // #nosec G115 -- the expected-page slice is bounded by MaxPages above.
 		report.Failures = append(report.Failures, "final PDF page count differs from expected plan raster pages")
 	}
+	// Only the headers are read here; each expected page is decoded next to
+	// its rendered page and released, so pages are never all held at once.
 	dimensions := make([]image.Point, len(request.ExpectedPages))
-	expectedImages := make([]image.Image, len(request.ExpectedPages))
 	var expectedBytes uint64
 	for index, expected := range request.ExpectedPages {
 		if expected.Page != uint32(index+1) || !validSHA256(expected.PlanRasterManifest) || uint64(len(expected.PNG)) > limits.MaxRasterBytesPage {
@@ -219,16 +226,11 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 		if expectedBytes > limits.MaxTotalRasterBytes {
 			return Report{}, ErrLimit
 		}
-		decoded, err := png.Decode(bytes.NewReader(expected.PNG))
-		if err != nil || decoded.Bounds().Min != (image.Point{}) || decoded.Bounds().Empty() {
-			return Report{}, fmt.Errorf("%w: expected page %d PNG", ErrInvalid, expected.Page)
+		size, err := pngSize(expected.PNG, limits.MaxPixelsPerPage)
+		if err != nil {
+			return Report{}, fmt.Errorf("%w: expected page %d PNG: %w", ErrInvalid, expected.Page, err)
 		}
-		pixels := uint64(decoded.Bounds().Dx()) * uint64(decoded.Bounds().Dy()) // #nosec G115 -- decoded dimensions are bounded by MaxPixelsPerPage before use.
-		if pixels == 0 || pixels > limits.MaxPixelsPerPage {
-			return Report{}, ErrLimit
-		}
-		dimensions[index] = decoded.Bounds().Size()
-		expectedImages[index] = decoded
+		dimensions[index] = size
 	}
 	raster, err := rasterizer.Rasterize(ctx, append([]byte(nil), request.PDF...), request.DPI, dimensions, limits)
 	if err != nil {
@@ -247,11 +249,18 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 		if uint64(len(actualPNG)) > limits.MaxRasterBytesPage || totalRaster > limits.MaxTotalRasterBytes {
 			return Report{}, ErrLimit
 		}
+		if size, err := pngSize(actualPNG, limits.MaxPixelsPerPage); err != nil || size != dimensions[index] {
+			return Report{}, fmt.Errorf("%w: page %d PNG geometry", ErrRaster, index+1)
+		}
 		actual, err := png.Decode(bytes.NewReader(actualPNG))
 		if err != nil || actual.Bounds().Min != (image.Point{}) || actual.Bounds().Size() != dimensions[index] {
 			return Report{}, fmt.Errorf("%w: page %d PNG geometry", ErrRaster, index+1)
 		}
-		evidence, err := comparePage(ctx, uint32(index+1), request.ExpectedPages[index], expectedImages[index], actualPNG, actual, request.Tolerance)
+		expectedImage, err := png.Decode(bytes.NewReader(request.ExpectedPages[index].PNG))
+		if err != nil || expectedImage.Bounds().Min != (image.Point{}) || expectedImage.Bounds().Size() != dimensions[index] {
+			return Report{}, fmt.Errorf("%w: expected page %d PNG", ErrInvalid, index+1)
+		}
+		evidence, err := comparePage(ctx, uint32(index+1), request.ExpectedPages[index], expectedImage, actualPNG, actual, request.Tolerance)
 		if err != nil {
 			return Report{}, err
 		}
@@ -261,6 +270,16 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 		}
 	}
 	checkStructure(&report, request.Structure)
+	// The structure counters count bytes anywhere in the file, stream data
+	// included; a required tagged structure is confirmed from the catalog.
+	if request.Structure.RequireTagged {
+		if tags, err := InspectTags(ctx, request.PDF, TagInspectionLimits{}); err != nil || !tags.Marked || tags.StructureRoot == 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Report{}, ctxErr
+			}
+			report.Failures = append(report.Failures, "missing required tagged structure")
+		}
+	}
 	compliance, failures, err := validateCompliance(request.RequiredCompliance, request.Compliance)
 	if err != nil {
 		return Report{}, err
@@ -280,6 +299,21 @@ func Verify(ctx context.Context, request Request, rasterizer Rasterizer) (Report
 		return report, ErrVerificationFailed
 	}
 	return report, nil
+}
+
+// pngSize reads a PNG header and checks its pixel count before anything is
+// decoded: png.Decode allocates the whole image from the header, so a
+// 142-byte file declaring 16000x16000 cost 976 MB before the pixel check.
+func pngSize(data []byte, maxPixels uint64) (image.Point, error) {
+	config, err := png.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return image.Point{}, err
+	}
+	pixels := uint64(config.Width) * uint64(config.Height) // #nosec G115 -- PNG dimensions are positive 31-bit values.
+	if pixels == 0 || pixels > maxPixels {
+		return image.Point{}, ErrLimit
+	}
+	return image.Point{X: config.Width, Y: config.Height}, nil
 }
 
 func comparePage(ctx context.Context, page uint32, expected ExpectedRasterPage, expectedImage image.Image, actualPNG []byte, actual image.Image, tolerance RasterTolerance) (PageEvidence, error) {

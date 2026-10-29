@@ -286,6 +286,7 @@ func reconstruct(ctx context.Context, source *importpdf.Source, options Options)
 		id   int
 	}
 	retainedResources := make(map[importpdf.ObjRef]*retainedResourceObject)
+	resourceCache := newReachableCache()
 	retainedResourceValues := make(map[retainedResourceValue][]*retainedResourceObject)
 	directResourceIDs := make(map[retainedResourceValue][]directResourceObject)
 	retainDirectResource := func(body []byte) (int, error) {
@@ -348,7 +349,7 @@ func reconstruct(ctx context.Context, source *importpdf.Source, options Options)
 		if err != nil {
 			return nil, fmt.Errorf("reconstruct page %d resources: %w", pageNumber, err)
 		}
-		reachable, err := reachableObjects(resources, objectBodies)
+		reachable, err := reachableObjects(ctx, resources, objectBodies, resourceCache)
 		if err != nil {
 			return nil, fmt.Errorf("reconstruct page %d resources: %w", pageNumber, err)
 		}
@@ -530,10 +531,86 @@ type reachableObject struct {
 	preserveKeys bool
 }
 
-func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]reachableObject, error) {
+// reachableCache keeps, across the pages of one reconstruction, what
+// reachableObjects derives from each object body: pages that share a font or
+// image would otherwise parse and sanitize it again for every page, which no
+// byte limit charges. Every entry is reused only for the body it came from.
+type reachableCache struct {
+	inlined   map[importpdf.ObjRef]cachedBytes
+	sanitized map[sanitizeCacheKey]cachedSanitized
+	nameMap   map[importpdf.ObjRef]cachedBool
+	roleFree  map[importpdf.ObjRef]cachedBool
+}
+
+type sanitizeCacheKey struct {
+	ref          importpdf.ObjRef
+	preserveKeys bool
+}
+
+type cachedBytes struct{ source, value []byte }
+
+type cachedBool struct {
+	source []byte
+	value  bool
+}
+
+type cachedSanitized struct {
+	source []byte
+	value  sanitizedPDFObject
+	err    error
+}
+
+func newReachableCache() *reachableCache {
+	return &reachableCache{
+		inlined:   make(map[importpdf.ObjRef]cachedBytes),
+		sanitized: make(map[sanitizeCacheKey]cachedSanitized),
+		nameMap:   make(map[importpdf.ObjRef]cachedBool),
+		roleFree:  make(map[importpdf.ObjRef]cachedBool),
+	}
+}
+
+// sameBody reports whether a and b are the same body; page graphs of one
+// source hand out equal bodies, usually the same slice.
+func sameBody(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return len(a) == 0 || &a[0] == &b[0] || bytes.Equal(a, b)
+}
+
+func reachableObjects(ctx context.Context, resources []byte, objects map[importpdf.ObjRef][]byte, cache *reachableCache) ([]reachableObject, error) {
+	if cache == nil {
+		cache = newReachableCache()
+	}
 	byKey := make(map[refKey]importpdf.ObjRef, len(objects))
 	for ref := range objects {
 		byKey[refKey{objectNumber: ref.ObjectNumber(), generation: ref.Generation()}] = ref
+	}
+	lookup := func(key refKey) ([]byte, bool) {
+		ref, ok := byKey[key]
+		if !ok {
+			return nil, false
+		}
+		return objects[ref], true
+	}
+	inline := func(ref importpdf.ObjRef) []byte {
+		body := objects[ref]
+		if entry, ok := cache.inlined[ref]; ok && sameBody(entry.source, body) {
+			return entry.value
+		}
+		value := inlineStreamParameterRefs(body, lookup)
+		cache.inlined[ref] = cachedBytes{source: body, value: value}
+		return value
+	}
+	sanitize := func(ref importpdf.ObjRef, preserveKeys bool) (sanitizedPDFObject, error) {
+		body := objects[ref]
+		key := sanitizeCacheKey{ref: ref, preserveKeys: preserveKeys}
+		if entry, ok := cache.sanitized[key]; ok && sameBody(entry.source, body) {
+			return entry.value, entry.err
+		}
+		value, err := sanitizePDFObjectWithReferences(inline(ref), preserveKeys)
+		cache.sanitized[key] = cachedSanitized{source: body, value: value, err: err}
+		return value, err
 	}
 	root, err := sanitizePDFObjectWithReferences(resources, false)
 	if err != nil {
@@ -548,7 +625,16 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 			return false
 		}
 		ref, ok := byKey[key]
-		return !ok || objectIsResourceNameMap(objects[ref])
+		if !ok {
+			return true
+		}
+		body := objects[ref]
+		if entry, ok := cache.nameMap[ref]; ok && sameBody(entry.source, body) {
+			return entry.value
+		}
+		value := objectIsResourceNameMap(body)
+		cache.nameMap[ref] = cachedBool{source: body, value: value}
+		return value
 	}
 	// roleIndependent reports whether the referenced object sanitizes to the
 	// same value and child references under both roles. Only a dictionary at
@@ -560,18 +646,20 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 		if !ok {
 			return false
 		}
-		body := inlineStreamParameterRefs(objects[ref], objects)
-		asResource, err := sanitizePDFObjectWithReferences(body, nameMapRole(key, true))
-		if err != nil {
-			return false
+		body := objects[ref]
+		if entry, ok := cache.roleFree[ref]; ok && sameBody(entry.source, body) {
+			return entry.value
 		}
-		asOrdinary, err := sanitizePDFObjectWithReferences(body, false)
-		if err != nil {
-			return false
+		value := false
+		if asResource, err := sanitize(ref, nameMapRole(key, true)); err == nil {
+			if asOrdinary, err := sanitize(ref, false); err == nil {
+				value = bytes.Equal(asResource.value, asOrdinary.value) &&
+					sameRefKeys(asResource.resourceNameRefs, asOrdinary.resourceNameRefs) &&
+					sameRefKeys(asResource.normalRefs, asOrdinary.normalRefs)
+			}
 		}
-		return bytes.Equal(asResource.value, asOrdinary.value) &&
-			sameRefKeys(asResource.resourceNameRefs, asOrdinary.resourceNameRefs) &&
-			sameRefKeys(asResource.normalRefs, asOrdinary.normalRefs)
+		cache.roleFree[ref] = cachedBool{source: body, value: value}
+		return value
 	}
 	conflict := func(resourceRefs, normalRefs map[refKey]bool) (refKey, bool) {
 		for _, ref := range sortedRefKeys(resourceRefs) {
@@ -615,6 +703,9 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 	processed := make(map[importpdf.ObjRef]bool, len(queue))
 	resultByRef := make(map[importpdf.ObjRef][]byte, len(objects))
 	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		pending := queue[0]
 		queue = queue[1:]
 		key := pending.key
@@ -625,12 +716,10 @@ func reachableObjects(resources []byte, objects map[importpdf.ObjRef][]byte) ([]
 		if processed[ref] {
 			continue
 		}
-		body, ok := objects[ref]
-		if !ok {
+		if _, ok := objects[ref]; !ok {
 			return nil, fmt.Errorf("referenced object %s is missing", ref)
 		}
-		body = inlineStreamParameterRefs(body, objects)
-		sanitized, err := sanitizePDFObjectWithReferences(body, pending.preserveKeys)
+		sanitized, err := sanitize(ref, pending.preserveKeys)
 		if err != nil {
 			return nil, fmt.Errorf("object %s: %w", ref, err)
 		}
@@ -708,18 +797,21 @@ func (b *pdfBuilder) bytes(ctx context.Context, rootID int) ([]byte, error) {
 		return nil, b.err
 	}
 	var out bytes.Buffer
-	estimated := int64(len("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n") + 128 + len(b.objects)*20)
+	// minimum counts only bytes every output has (header, objects, one xref
+	// row each and the free row), so the early check never refuses an output
+	// that fits; the trailer slack only sizes the buffer.
+	minimum := int64(len("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n") + (len(b.objects)+1)*20)
 	for id, object := range b.objects {
 		addition := int64(len(object.body) + len(strconv.Itoa(id+1)) + len(" 0 obj\nendobj\n"))
-		if addition > int64(^uint(0)>>1)-estimated {
+		if addition > int64(^uint(0)>>1)-minimum-256 {
 			return nil, fmt.Errorf("%w: output size overflow", ErrLimitExceeded)
 		}
-		estimated += addition
+		minimum += addition
 	}
-	if b.maxOutputBytes > 0 && estimated > b.maxOutputBytes {
+	if b.maxOutputBytes > 0 && minimum > b.maxOutputBytes {
 		return nil, fmt.Errorf("%w: output bytes exceed maximum %d", ErrLimitExceeded, b.maxOutputBytes)
 	}
-	out.Grow(int(estimated))
+	out.Grow(int(minimum) + len(b.objects) + 128)
 	out.WriteString("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")
 	offsets := make([]int, len(b.objects)+1)
 	for id, object := range b.objects {

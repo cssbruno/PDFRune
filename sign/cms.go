@@ -25,6 +25,7 @@ var (
 	oidMessageDigest   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
 	oidSigningTime     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
 	oidSigningCertV2   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 47}
+	oidSigningCert     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 12}
 	oidSHA1            = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
 	oidSHA256          = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	oidSHA384          = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
@@ -411,8 +412,13 @@ func verifySignerInfo(signerInfo derValue, certificates []*x509.Certificate, con
 		return nil, errors.New("pdfsigning: signed attributes are required")
 	}
 	signedAttrsDER := der(0x31, children[3].Content)
-	messageDigest, signingTime, err := decodeSignedAttributes(signedAttrsDER)
+	messageDigest, signingTime, signingCert, err := decodeSignedAttributesWithSigningCertificate(signedAttrsDER)
 	if err != nil {
+		return nil, err
+	}
+	// The sid and certificate set are outside the signature; the ESS
+	// signing-certificate attribute is inside it, so it alone binds the signer.
+	if err := signingCert.matches(signer); err != nil {
 		return nil, err
 	}
 	expectedDigest := hashBytes(digest, content)
@@ -444,13 +450,19 @@ func verifySignerInfo(signerInfo derValue, certificates []*x509.Certificate, con
 				intermediates.AddCert(cert)
 			}
 		}
-		_, err := signer.Verify(x509.VerifyOptions{
+		// ExtKeyUsageAny is needed because crypto/x509 cannot match the
+		// documentSigning OID, but it also skips the check that each CA's EKU
+		// allows the leaf's use, so that check is made on the chains here.
+		chains, err := signer.Verify(x509.VerifyOptions{
 			Roots:         truststore,
 			Intermediates: intermediates,
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("verify signer certificate: %w", err)
+		}
+		if !anyChainAllowsDocumentSigning(chains) {
+			return nil, errors.New("verify signer certificate: an issuing CA's extended key usage does not allow document signing")
 		}
 		trusted = true
 	}
@@ -497,19 +509,110 @@ func cadesSignedAttributes(messageDigest []byte, cert *x509.Certificate) ([]byte
 }
 
 func decodeSignedAttributes(attrsDER []byte) ([]byte, *time.Time, error) {
+	messageDigest, signingTime, _, err := decodeSignedAttributesWithSigningCertificate(attrsDER)
+	return messageDigest, signingTime, err
+}
+
+// essSigningCertificate is the first ESSCertID of a signed ESS
+// signing-certificate (v1, SHA-1) or signing-certificate-v2 attribute.
+type essSigningCertificate struct {
+	present      bool
+	hash         crypto.Hash
+	certHash     []byte
+	issuerSerial *derValue
+}
+
+func (e essSigningCertificate) matches(cert *x509.Certificate) error {
+	if !e.present {
+		return nil
+	}
+	if !bytes.Equal(e.certHash, hashBytes(e.hash, cert.Raw)) {
+		return errors.New("pdfsigning: signer certificate does not match the signed ESS signing-certificate attribute")
+	}
+	if e.issuerSerial == nil {
+		return nil
+	}
+	parts, err := readDERChildren(e.issuerSerial.Content)
+	if err != nil || len(parts) != 2 || parts[0].Tag != 0x30 {
+		return errors.New("pdfsigning: invalid ESS issuerSerial")
+	}
+	var serial *big.Int
+	if rest, err := asn1.Unmarshal(parts[1].Full, &serial); err != nil || len(rest) != 0 {
+		return errors.New("pdfsigning: invalid ESS issuerSerial")
+	}
+	names, err := readDERChildren(parts[0].Content)
+	if err != nil {
+		return errors.New("pdfsigning: invalid ESS issuerSerial")
+	}
+	issuerMatches := false
+	for _, name := range names {
+		if name.Tag == 0xa4 && bytes.Equal(name.Content, cert.RawIssuer) {
+			issuerMatches = true
+		}
+	}
+	if !issuerMatches || serial.Cmp(cert.SerialNumber) != 0 {
+		return errors.New("pdfsigning: signer certificate does not match the signed ESS issuerSerial")
+	}
+	return nil
+}
+
+// decodeESSSigningCertificate reads the first ESSCertID(v2) of value. v2's
+// hashAlgorithm defaults to SHA-256; v1 always uses SHA-1.
+func decodeESSSigningCertificate(value derValue, v2 bool) (essSigningCertificate, error) {
+	invalid := errors.New("pdfsigning: invalid ESS signing-certificate attribute")
+	if value.Tag != 0x30 {
+		return essSigningCertificate{}, invalid
+	}
+	fields, err := readDERChildren(value.Content)
+	if err != nil || len(fields) == 0 || fields[0].Tag != 0x30 {
+		return essSigningCertificate{}, invalid
+	}
+	certIDs, err := readDERChildren(fields[0].Content)
+	if err != nil || len(certIDs) == 0 || certIDs[0].Tag != 0x30 {
+		return essSigningCertificate{}, invalid
+	}
+	parts, err := readDERChildren(certIDs[0].Content)
+	if err != nil || len(parts) == 0 {
+		return essSigningCertificate{}, invalid
+	}
+	result := essSigningCertificate{present: true, hash: crypto.SHA1}
+	if v2 {
+		result.hash = crypto.SHA256
+		if parts[0].Tag == 0x30 {
+			if result.hash, err = decodeDigestAlgorithm(parts[0]); err != nil {
+				return essSigningCertificate{}, err
+			}
+			parts = parts[1:]
+		}
+	}
+	if len(parts) == 0 || parts[0].Tag != 0x04 || len(parts) > 2 {
+		return essSigningCertificate{}, invalid
+	}
+	result.certHash = parts[0].Content
+	if len(parts) == 2 {
+		if parts[1].Tag != 0x30 {
+			return essSigningCertificate{}, invalid
+		}
+		result.issuerSerial = &parts[1]
+	}
+	return result, nil
+}
+
+func decodeSignedAttributesWithSigningCertificate(attrsDER []byte) ([]byte, *time.Time, essSigningCertificate, error) {
+	var signingCert essSigningCertificate
 	attrs, rest, err := readDER(attrsDER)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, essSigningCertificate{}, err
 	}
 	if len(rest) != 0 {
-		return nil, nil, errors.New("pdfsigning: invalid signed attributes")
+		return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid signed attributes")
 	}
 	if err := expectTag(attrs, 0x31, "signed attributes"); err != nil {
-		return nil, nil, err
+		return nil, nil, essSigningCertificate{}, err
 	}
 	children, err := readDERChildren(attrs.Content)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, essSigningCertificate{}, err
 	}
 	var messageDigest []byte
 	contentTypeSeen := false
@@ -520,18 +623,18 @@ func decodeSignedAttributes(attrsDER []byte) ([]byte, *time.Time, error) {
 	for _, attr := range children {
 		attrChildren, err := readDERChildren(attr.Content)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, essSigningCertificate{}, err
 		}
 		if len(attrChildren) != 2 {
-			return nil, nil, errors.New("pdfsigning: invalid signed attribute")
+			return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid signed attribute")
 		}
 		oid, err := decodeOID(attrChildren[0])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, essSigningCertificate{}, err
 		}
 		values, err := readDERChildren(attrChildren[1].Content)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, essSigningCertificate{}, err
 		}
 		if len(values) == 0 {
 			continue
@@ -539,49 +642,59 @@ func decodeSignedAttributes(attrsDER []byte) ([]byte, *time.Time, error) {
 		switch {
 		case oid.Equal(oidContentType):
 			if contentTypeSeen {
-				return nil, nil, errors.New("pdfsigning: duplicate contentType attribute")
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: duplicate contentType attribute")
 			}
 			if len(values) != 1 {
-				return nil, nil, errors.New("pdfsigning: invalid contentType attribute")
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid contentType attribute")
 			}
 			contentType, err := decodeOID(values[0])
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, essSigningCertificate{}, err
 			}
 			if !contentType.Equal(oidData) {
-				return nil, nil, fmt.Errorf("pdfsigning: unsupported contentType attribute %v", contentType)
+				return nil, nil, essSigningCertificate{}, fmt.Errorf("pdfsigning: unsupported contentType attribute %v", contentType)
 			}
 			contentTypeSeen = true
 		case oid.Equal(oidMessageDigest):
 			if messageDigestSeen {
-				return nil, nil, errors.New("pdfsigning: duplicate messageDigest attribute")
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: duplicate messageDigest attribute")
 			}
 			if len(values) != 1 {
-				return nil, nil, errors.New("pdfsigning: invalid messageDigest attribute")
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid messageDigest attribute")
 			}
 			if err := expectTag(values[0], 0x04, "messageDigest attribute"); err != nil {
-				return nil, nil, err
+				return nil, nil, essSigningCertificate{}, err
 			}
 			messageDigest = append([]byte(nil), values[0].Content...)
 			messageDigestSeen = true
 		case oid.Equal(oidSigningTime):
 			if len(values) != 1 {
-				return nil, nil, errors.New("pdfsigning: invalid signingTime attribute")
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid signingTime attribute")
 			}
 			var t time.Time
 			if _, err := asn1.Unmarshal(values[0].Full, &t); err != nil {
-				return nil, nil, err
+				return nil, nil, essSigningCertificate{}, err
 			}
 			signingTime = &t
+		case oid.Equal(oidSigningCertV2) || oid.Equal(oidSigningCert):
+			if signingCert.present {
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: duplicate ESS signing-certificate attribute")
+			}
+			if len(values) != 1 {
+				return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: invalid ESS signing-certificate attribute")
+			}
+			if signingCert, err = decodeESSSigningCertificate(values[0], oid.Equal(oidSigningCertV2)); err != nil {
+				return nil, nil, essSigningCertificate{}, err
+			}
 		}
 	}
 	if !contentTypeSeen {
-		return nil, nil, errors.New("pdfsigning: missing contentType attribute")
+		return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: missing contentType attribute")
 	}
 	if !messageDigestSeen || len(messageDigest) == 0 {
-		return nil, nil, errors.New("pdfsigning: missing messageDigest attribute")
+		return nil, nil, essSigningCertificate{}, errors.New("pdfsigning: missing messageDigest attribute")
 	}
-	return messageDigest, signingTime, nil
+	return messageDigest, signingTime, signingCert, nil
 }
 
 func digestAlgorithmID(digest crypto.Hash) []byte {
@@ -847,6 +960,47 @@ func publicKeysEqual(a, b any) bool {
 	}
 	right, err := x509.MarshalPKIXPublicKey(b)
 	return err == nil && bytes.Equal(left, right)
+}
+
+// Extended key usages of a CA under which a document signer may be issued.
+var (
+	oidMicrosoftDocumentSigning = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 10, 3, 12}
+	oidAdobeAuthenticDocuments  = asn1.ObjectIdentifier{1, 2, 840, 113583, 1, 1, 5}
+)
+
+func anyChainAllowsDocumentSigning(chains [][]*x509.Certificate) bool {
+	for _, chain := range chains {
+		allowed := true
+		for _, ca := range chain[1:] {
+			if !caAllowsDocumentSigning(ca) {
+				allowed = false
+				break
+			}
+		}
+		if allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// caAllowsDocumentSigning reports whether ca's extended key usage, when it
+// has one, lets it issue document signers; a CA limited to TLS does not.
+func caAllowsDocumentSigning(ca *x509.Certificate) bool {
+	if len(ca.ExtKeyUsage) == 0 && len(ca.UnknownExtKeyUsage) == 0 {
+		return true
+	}
+	for _, usage := range ca.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageAny || usage == x509.ExtKeyUsageEmailProtection {
+			return true
+		}
+	}
+	for _, oid := range ca.UnknownExtKeyUsage {
+		if oid.Equal(oidDocumentSigning) || oid.Equal(oidMicrosoftDocumentSigning) || oid.Equal(oidAdobeAuthenticDocuments) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateDocumentSignerCertificate(cert *x509.Certificate) error {

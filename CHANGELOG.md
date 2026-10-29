@@ -68,6 +68,45 @@
 - `pdfcdr` writes indirect references as `N G R`; a signed `+7 0 R` was
   resolved to object 7 but copied unchanged, and renumbering then left it
   pointing at whichever output object received number 7.
+- `pdfcdr` splices an indirect `/Length`, `/Filter` or `/DecodeParms` as its
+  parsed value; a trailing comment in the referenced object (`57 % len`)
+  swallowed the keys after it, and trailing tokens added keys. A key repeated
+  in one dictionary is no longer inlined once per repetition (1000 copies of
+  a 1 MB value were built before the duplicate was refused).
+- `pdfcdr` sanitizes an object shared by many pages once per reconstruction
+  and checks the context per object; 40 pages sharing one large font took
+  forty times as long as one, which no byte limit charged.
+- `pdfcdr` `MaxOutputBytes` no longer refuses an output that fits: the early
+  check counted a fixed trailer allowance.
+- `importpdf` pages share cached object bodies and each object's reference
+  list instead of copying and parsing them per page, and a caller waiting
+  for a shared `Source` stops when its context ends. New `Source.Root` and
+  `Source.PageUserUnit`.
+- `sign` verification requires the signer certificate to match the signed
+  ESS signing-certificate(-v2) attribute when present (hash, and issuer and
+  serial when given). The sid and certificate set are outside the signature,
+  so they could be swapped for another trusted certificate over the same
+  key, which Verify then reported as the signer. Duplicate ESS attributes
+  are refused.
+- `sign` trusts a chain only when each CA's extended key usage, if it has
+  one, allows document signing (any, documentSigning, emailProtection,
+  Microsoft or Adobe document signing); a TLS-only CA could issue a trusted
+  signer because the chain was built with `ExtKeyUsageAny`.
+- `inspect.FirstPageSizePoints` reads `/UserUnit` from the first page of the
+  trailer's catalog; orphan catalogs changed the size, and thousands of decoy
+  catalogs each walked a page tree. New `FirstPageSizePointsContext`.
+- `inspect` builds a font written inside `/Resources` once per content
+  stream instead of on every `Tf`. New `PagesTextContext` returns per-page
+  text under one parse and one document decode budget.
+- `characterize.Build` extracts a fixture's pages with one parse and one
+  decode budget (it reopened the file per page with a fresh budget) and
+  stops at `MaxJSONBytes` as text accumulates.
+- `pdfverify.InspectTags` reads objects from the cross-reference data and
+  `/MarkInfo` and the structure-tree root from the trailer's catalog; text
+  inside a stream that looked like a structure tree made an untagged PDF
+  pass. `Verify`'s `RequireTagged` uses the same check, checks the PDF page
+  count first, reads PNG headers before decoding, decodes expected pages one
+  at a time, and the Poppler pin must equal the reported version.
 - `sign` writes non-ASCII signature dictionary text (`/Name`, `/Reason`,
   `/Location`, `/ContactInfo`, field `/T`) as UTF-16BE instead of `?`.
 - `sign` verification and extraction read cross-reference streams, hybrid

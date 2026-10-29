@@ -98,6 +98,9 @@ type textExtractor struct {
 	out     strings.Builder
 	objects *pdfResourceObjects
 	fonts   map[streamObjectRef]*pdfFont
+	// directFonts holds fonts written inside this extractor's resources, by
+	// resource name; without it each Tf rebuilt their /W or /Differences.
+	directFonts map[string]*pdfFont
 
 	state         textGraphicsState
 	stack         []textGraphicsState
@@ -434,6 +437,9 @@ func (e *textExtractor) selectFont(name string) error {
 			e.state.font, e.state.hasFont = font, true
 			return nil
 		}
+	} else if font, ok := e.directFonts[name]; ok {
+		e.state.font, e.state.hasFont = font, true
+		return nil
 	}
 	font, err := e.objects.loadPDFFont(fontObject)
 	if err != nil {
@@ -441,6 +447,11 @@ func (e *textExtractor) selectFont(name string) error {
 	}
 	if reference.kind == pdfObjectRef {
 		e.fonts[reference.ref] = font
+	} else {
+		if e.directFonts == nil {
+			e.directFonts = make(map[string]*pdfFont)
+		}
+		e.directFonts[name] = font
 	}
 	e.state.font, e.state.hasFont = font, true
 	return nil

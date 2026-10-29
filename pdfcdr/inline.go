@@ -5,8 +5,6 @@ package pdfcdr
 
 import (
 	"bytes"
-
-	"github.com/cssbruno/pdfrune/importpdf"
 )
 
 // inlinedStreamParameterKeys may hold an indirect reference in producer
@@ -25,7 +23,7 @@ var inlinedStreamParameterKeys = map[string]bool{
 // plain direct value: not a stream and without references of its own. Any
 // other input is returned unchanged, and the sanitizer then rejects what it
 // still cannot accept.
-func inlineStreamParameterRefs(body []byte, objects map[importpdf.ObjRef][]byte) []byte {
+func inlineStreamParameterRefs(body []byte, lookup func(refKey) ([]byte, bool)) []byte {
 	scanner := &pdfValueScanner{
 		data:             body,
 		resourceNameRefs: make(map[refKey]bool),
@@ -41,10 +39,17 @@ func inlineStreamParameterRefs(body []byte, objects map[importpdf.ObjRef][]byte)
 		value      []byte
 	}
 	var replacements []replacement
-	for {
+	// A repeated key is refused by the sanitizer; inlining it first would
+	// copy the target once per repetition (1000 keys naming a 1 MB value
+	// built a 1 GB body before that refusal).
+	inlined := make(map[string]bool, len(inlinedStreamParameterKeys))
+	for entries := 0; ; entries++ {
 		scanner.skipSpace()
 		if scanner.has(">>") || scanner.pos >= len(body) || body[scanner.pos] != '/' {
 			break
+		}
+		if entries >= maxPDFDictEntries {
+			return body
 		}
 		keyStart := scanner.pos + 1
 		keyEnd := scanner.nameEnd()
@@ -62,16 +67,23 @@ func inlineStreamParameterRefs(body []byte, objects map[importpdf.ObjRef][]byte)
 		if !inlinedStreamParameterKeys[key] {
 			continue
 		}
+		if inlined[key] {
+			return body
+		}
+		inlined[key] = true
 		ref, ok := singleIndirectRefKey(body[valueStart:valueEnd])
 		if !ok {
 			continue
 		}
-		target, ok := objectBodyByKey(ref, objects)
+		target, ok := lookup(ref)
 		if !ok {
 			continue
 		}
-		target = bytes.TrimSpace(target)
-		if len(target) == 0 || bytes.Contains(target, []byte("stream")) {
+		// The target is spliced as its parsed value, never as raw text: a
+		// trailing comment ("57 % len") would swallow the keys after it, and
+		// trailing tokens ("1 /Filter /DCTDecode") would add keys.
+		target, ok = singleDirectValue(target)
+		if !ok || bytes.Contains(target, []byte("stream")) {
 			continue
 		}
 		// A parameter dictionary may keep its /JBIG2Globals stream reference;
@@ -96,10 +108,26 @@ func inlineStreamParameterRefs(body []byte, objects map[importpdf.ObjRef][]byte)
 	return append(out, body[previous:]...)
 }
 
-func objectBodyByKey(key refKey, objects map[importpdf.ObjRef][]byte) ([]byte, bool) {
-	ref, ok := resourceObjectRef(key, objects)
-	if !ok {
+// singleDirectValue returns the one value data holds, re-serialized without
+// comments, or false when data is empty or holds anything after the value.
+func singleDirectValue(data []byte) ([]byte, bool) {
+	scanner := &pdfValueScanner{
+		data:             data,
+		resourceNameRefs: make(map[refKey]bool),
+		normalRefCounts:  make(map[refKey]int),
+	}
+	scanner.skipSpace()
+	if scanner.pos >= len(data) {
 		return nil, false
 	}
-	return objects[ref], true
+	value, end, drop, err := scanner.sanitizeValue()
+	if err != nil || drop {
+		return nil, false
+	}
+	scanner.pos = end
+	scanner.skipSpace()
+	if scanner.pos != len(data) {
+		return nil, false
+	}
+	return value, true
 }

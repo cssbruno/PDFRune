@@ -93,6 +93,9 @@ func SignedAttributeValues(signature []byte, oid asn1.ObjectIdentifier) ([]asn1.
 }
 
 // SignerCertificate returns the certificate referenced by the first SignerInfo.
+// It checks neither the signature nor the signed ESS signing-certificate
+// attribute; the certificate identifies the signer only after
+// VerifyDetachedCMS or VerifyDetachedCMSIntegrity accepted the same CMS.
 func SignerCertificate(signature []byte) (*x509.Certificate, error) {
 	info, err := InspectCMS(signature)
 	if err != nil {
