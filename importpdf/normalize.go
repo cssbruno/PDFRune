@@ -411,7 +411,9 @@ func (n *pdfNormalizer) splitObjectStreamContext(ctx context.Context, streamNumb
 		}
 		pos = skipPDFSpace(decoded[:first], next)
 		offset, _, next, ok := readPDFIntToken(decoded[:first], pos)
-		if !ok || offset < 0 || first+offset > len(decoded) || (i > 0 && offset < offsets[i-1]) {
+		// Subtract instead of adding: an offset near MaxInt would wrap
+		// first+offset negative and pass the check.
+		if !ok || offset < 0 || offset > len(decoded)-first || (i > 0 && offset < offsets[i-1]) {
 			return nil, nil, fmt.Errorf("PDF object stream %d has an invalid header", streamNumber)
 		}
 		pos = next
