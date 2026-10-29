@@ -19,6 +19,13 @@
   only its content stream.
 - `inspect.FirstPageSizePoints` applies the page `/UserUnit` (`/Rotate` is
   still not applied).
+- `inspect` uses the Adobe Core 14 ASCII advances of Helvetica-Bold (and
+  Arial Bold) and the four Times faces for fonts written without `/Widths`.
+- `importpdf` measures a stream whose `/Length` is wrong only up to its own
+  `endobj`; an `endstream` found past it belongs to a later object, and
+  measuring to it copied the rest of the file once per broken stream. Such a
+  stream whose data contains `endobj` is now reported as missing
+  `endstream`.
 - `importpdf` repair leaves out object numbers past `MaxXrefEntries`, which
   made a 133-byte file allocate about 1.9 GB.
 - `importpdf` normalization leaves out object numbers past 1,600,000 and

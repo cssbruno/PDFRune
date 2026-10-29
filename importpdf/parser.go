@@ -1720,6 +1720,12 @@ func (doc *Source) skipObjectStreamContext(ctx context.Context, ref ObjRef, data
 		}
 	}
 	end := bytes.Index(data[dataStart:], []byte("endstream"))
+	// The measured stream ends inside its own object: an endstream found only
+	// past this object's endobj belongs to a later object, and measuring to it
+	// would copy the rest of the file once per broken stream.
+	if objEnd := bytes.Index(data[dataStart:], []byte("endobj")); objEnd >= 0 && (end < 0 || objEnd < end) {
+		end = -1
+	}
 	if end < 0 {
 		if !complete {
 			return 0, false, nil, nil

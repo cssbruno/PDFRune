@@ -449,10 +449,58 @@ var helveticaWidths = [95]float64{
 	556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
 }
 
+// The bold Helvetica and Times advances for codes 32 to 126 come from the
+// Adobe Core 14 AFM files (quotesingle at 39, grave at 96).
+var helveticaBoldWidths = [95]float64{
+	278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278,
+	556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611,
+	975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778,
+	667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556,
+	333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611,
+	611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+}
+
+var timesRomanWidths = [95]float64{
+	250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278,
+	500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+	921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+	556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+	333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+	500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541,
+}
+
+var timesBoldWidths = [95]float64{
+	250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+	500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+	930, 722, 667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667, 944, 722, 778,
+	611, 778, 722, 556, 667, 722, 722, 1000, 722, 722, 667, 333, 278, 333, 581, 500,
+	333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333, 556, 278, 833, 556, 500,
+	556, 556, 444, 389, 333, 556, 500, 722, 500, 500, 444, 394, 220, 394, 520,
+}
+
+var timesItalicWidths = [95]float64{
+	250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278,
+	500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500,
+	920, 611, 611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556, 833, 667, 722,
+	611, 722, 611, 500, 556, 722, 611, 833, 611, 556, 556, 389, 278, 389, 422, 500,
+	333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278, 444, 278, 722, 500, 500,
+	500, 500, 389, 389, 278, 500, 444, 667, 444, 444, 389, 400, 275, 400, 541,
+}
+
+var timesBoldItalicWidths = [95]float64{
+	250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+	500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+	832, 667, 667, 667, 722, 667, 667, 722, 778, 389, 500, 667, 611, 889, 722, 722,
+	611, 722, 667, 556, 611, 722, 667, 889, 667, 611, 611, 333, 278, 333, 570, 500,
+	333, 500, 500, 444, 500, 444, 333, 500, 556, 278, 278, 500, 278, 778, 556, 500,
+	500, 500, 389, 389, 278, 556, 444, 667, 500, 444, 389, 348, 220, 348, 570,
+}
+
 // standardFontWidths fills the widths of a standard 14 font written without
 // /Widths, which generators such as PaperRune do. Helvetica (and Arial, which
-// shares its metrics) and Courier are exact for ASCII; other codes use the
-// font's typical letter width. Other fonts keep estimated widths.
+// shares its metrics), Helvetica-Bold, the four Times faces and Courier are
+// exact for ASCII; other codes use the font's typical letter width. Other
+// fonts keep estimated widths.
 func standardFontWidths(widths *pdfFontWidths, baseFont string) {
 	if plus := strings.IndexByte(baseFont, '+'); plus >= 0 {
 		baseFont = baseFont[plus+1:]
@@ -467,6 +515,16 @@ func standardFontWidths(widths *pdfFontWidths, baseFont string) {
 		other = 600
 	case baseFont == "Helvetica" || baseFont == "Helvetica-Oblique" || baseFont == "Arial" || baseFont == "ArialMT":
 		ascii = helveticaWidths
+	case baseFont == "Helvetica-Bold" || baseFont == "Helvetica-BoldOblique" || baseFont == "Arial-Bold" || baseFont == "Arial-BoldMT":
+		ascii = helveticaBoldWidths
+	case baseFont == "Times-Roman":
+		ascii, other = timesRomanWidths, 500
+	case baseFont == "Times-Bold":
+		ascii, other = timesBoldWidths, 500
+	case baseFont == "Times-Italic":
+		ascii, other = timesItalicWidths, 500
+	case baseFont == "Times-BoldItalic":
+		ascii, other = timesBoldItalicWidths, 500
 	default:
 		return
 	}
