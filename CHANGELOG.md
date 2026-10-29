@@ -55,6 +55,19 @@
   size, so objects whose spans nest each other cannot make AcroForm scanning
   quadratic, and bounds the rows of all xref streams of a `/Prev` chain at
   four times `MaxXrefEntries`.
+- `pdfcdr` no longer treats a dictionary as a resource-name map when its
+  `/Type`, `/S`, `/Subtype` or `/FT` is a name, its `/Type` or `/S` is a
+  reference, or its `/EF` or `/RF` is a dictionary. Such a dictionary under a
+  resource category key kept every removed key, so an action with its `/JS`
+  script, a widget annotation, or a file specification with its embedded
+  file crossed the reconstruction (none was reachable from a trigger). An
+  indirect `/S` or `/Type` there now refuses the document, as elsewhere.
+- `pdfcdr` drops dictionaries of every ISO 32000-2 action type (GoTo, Hide,
+  Named, SetOCGState, ImportData, Sound, Trans, GoTo3DView, GoToDp,
+  RichMediaExecute and ECMAScript were kept) and removes `/Next`.
+- `pdfcdr` writes indirect references as `N G R`; a signed `+7 0 R` was
+  resolved to object 7 but copied unchanged, and renumbering then left it
+  pointing at whichever output object received number 7.
 - `sign` writes non-ASCII signature dictionary text (`/Name`, `/Reason`,
   `/Location`, `/ContactInfo`, field `/T`) as UTF-16BE instead of `?`.
 - `sign` verification and extraction read cross-reference streams, hybrid

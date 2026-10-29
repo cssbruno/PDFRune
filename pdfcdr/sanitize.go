@@ -38,6 +38,8 @@ var removedPDFKeys = map[string]bool{
 	"Metadata":      true,
 	"Movie":         true,
 	"Names":         true,
+	// A chained action; rendering dictionaries never use /Next.
+	"Next": true,
 	// An OPI proxy names an external high-resolution file; the proxy image
 	// or form itself is kept and renders without it.
 	"OPI":        true,
@@ -54,17 +56,30 @@ var removedPDFKeys = map[string]bool{
 	"XFA":        true,
 }
 
+// removedActionNames lists every ISO 32000-2 action type (plus ECMAScript);
+// none is also a rendering /S value such as Transparency or Luminosity.
 var removedActionNames = map[string]bool{
-	"GoToE":      true,
-	"GoToR":      true,
-	"JavaScript": true,
-	"Launch":     true,
-	"Movie":      true,
-	"Rendition":  true,
-	"ResetForm":  true,
-	"SubmitForm": true,
-	"Thread":     true,
-	"URI":        true,
+	"ECMAScript":       true,
+	"GoTo":             true,
+	"GoTo3DView":       true,
+	"GoToDp":           true,
+	"GoToE":            true,
+	"GoToR":            true,
+	"Hide":             true,
+	"ImportData":       true,
+	"JavaScript":       true,
+	"Launch":           true,
+	"Movie":            true,
+	"Named":            true,
+	"Rendition":        true,
+	"ResetForm":        true,
+	"RichMediaExecute": true,
+	"SetOCGState":      true,
+	"Sound":            true,
+	"SubmitForm":       true,
+	"Thread":           true,
+	"Trans":            true,
+	"URI":              true,
 }
 
 var removedObjectTypes = map[string]bool{
@@ -219,6 +234,9 @@ func (s *pdfValueScanner) sanitizeValueWithDictionaryKeys(preserveKeys bool) ([]
 		value := append([]byte(nil), s.data[start:end]...)
 		if ref, ok := singleIndirectRefKey(value); ok {
 			s.normalRefCounts[ref]++
+			// "+7 0 R" resolves to object 7 here, but renumbering rewrites
+			// only unsigned references, so references are written plainly.
+			value = []byte(strconv.Itoa(ref.objectNumber) + " " + strconv.Itoa(ref.generation) + " R")
 		}
 		return value, end, false, nil
 	}

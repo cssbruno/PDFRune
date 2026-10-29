@@ -63,15 +63,30 @@ func resourceNameMapEnd(data []byte, pos int, budget *int) (int, bool) {
 		if s.pos >= len(data) || data[s.pos] != '/' {
 			return 0, false
 		}
-		s.nameEnd()
+		keyStart := s.pos + 1
+		key, err := canonicalPDFName(data[keyStart:s.nameEnd()])
+		if err != nil {
+			return 0, false
+		}
 		s.skipSpace()
 		if s.pos >= len(data) {
 			return 0, false
 		}
+		// Producers choose resource names, but a map whose /Type, /S, /Subtype
+		// or /FT is a name, whose /Type or /S is a reference, or whose /EF is a
+		// dictionary is an action, annotation, field or file specification
+		// shaped like a map; it gets the ordinary policy, which removes it.
+		structural := key == "Type" || key == "S" || key == "Subtype" || key == "FT"
 		switch ch := data[s.pos]; {
 		case ch == '/':
+			if structural {
+				return 0, false
+			}
 			s.nameEnd()
 		case ch == '[' || s.has("<<"):
+			if (key == "EF" || key == "RF") && s.has("<<") {
+				return 0, false
+			}
 			if err := s.skipValue(0, budget, pos); err != nil {
 				return 0, false
 			}
@@ -82,6 +97,9 @@ func resourceNameMapEnd(data []byte, pos int, budget *int) (int, bool) {
 			end := indirectReferenceEnd(data, start, s.tokenEnd())
 			if end == s.pos {
 				return 0, false // a number
+			}
+			if key == "Type" || key == "S" {
+				return 0, false
 			}
 			s.pos = end
 		default:
