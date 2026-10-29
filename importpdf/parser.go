@@ -408,6 +408,9 @@ type Source struct {
 	// that scan (or a reconstruction) in progress so it is not started again.
 	recovered map[ObjRef]int
 	scanning  bool
+	// readerAtCached counts the body bytes cached from readerAt; caching stops
+	// once they reach the source size, which overlapping spans can exceed.
+	readerAtCached int
 }
 
 // ForEachObjectBorrowedContext calls fn for every in-use classic-xref object
@@ -493,6 +496,9 @@ const (
 	maxReaderAtTailBytes   = 1 * 1024 * 1024
 	maxReaderAtXrefBytes   = 16 * 1024 * 1024
 	maxObjectResolveDepth  = 128
+	// maxXrefObjectNumber is the largest object number a rewritten xref table
+	// may name; the table has one row per number up to the largest.
+	maxXrefObjectNumber = MaxXrefEntries * 16
 )
 
 func (doc *Source) withOptions(options ImportOptions) (*Source, error) {
@@ -1233,7 +1239,8 @@ func (doc *Source) PageContext(ctx context.Context, pageNo int, boxName string) 
 		wrapped = wrapImportedPageContent(content, box)
 	}
 	objects := make(map[ObjRef][]byte)
-	if err := doc.collectReferencedObjectsContext(ctx, resources, objects, make(map[ObjRef]bool)); err != nil {
+	budget := doc.referencedObjectBytes()
+	if err := doc.collectReferencedObjectsContext(ctx, resources, objects, make(map[ObjRef]bool), &budget); err != nil {
 		return nil, err
 	}
 	objectRefs := sortedObjRefs(objects)
@@ -1269,6 +1276,10 @@ func (doc *Source) pageContentContext(ctx context.Context, page sourcePage) ([]b
 	if contents.kind == pdfValueArray {
 		values = contents.array
 	}
+	// An array may name one stream many times. Decoding it once keeps 10000
+	// entries for a stream that inflates to nothing, which the output limit
+	// never charges, from inflating its input 10000 times.
+	decodedRefs := make(map[ObjRef][]byte)
 	for _, value := range values {
 		if err := importContextErr(ctx); err != nil {
 			return nil, err
@@ -1277,17 +1288,20 @@ func (doc *Source) pageContentContext(ctx context.Context, page sourcePage) ([]b
 		if !ok {
 			return nil, errors.New("PDF page content must be an indirect stream")
 		}
-		body, err := doc.objectBodyContext(ctx, ref)
-		if err != nil {
-			return nil, err
-		}
-		dict, stream, err := doc.parseStreamContext(ctx, body)
-		if err != nil {
-			return nil, fmt.Errorf("invalid PDF content stream %d %d R: %w", ref.num, ref.gen, err)
-		}
-		decoded, err := decodePDFStreamContext(ctx, dict, stream)
-		if err != nil {
-			return nil, fmt.Errorf("unsupported PDF content stream %d %d R: %w", ref.num, ref.gen, err)
+		decoded, seen := decodedRefs[ref]
+		if !seen {
+			body, err := doc.objectBodyContext(ctx, ref)
+			if err != nil {
+				return nil, err
+			}
+			dict, stream, err := doc.parseStreamContext(ctx, body)
+			if err != nil {
+				return nil, fmt.Errorf("invalid PDF content stream %d %d R: %w", ref.num, ref.gen, err)
+			}
+			if decoded, err = decodePDFStreamContext(ctx, dict, stream); err != nil {
+				return nil, fmt.Errorf("unsupported PDF content stream %d %d R: %w", ref.num, ref.gen, err)
+			}
+			decodedRefs[ref] = decoded
 		}
 		if out.Len() > 0 {
 			out.WriteByte('\n')
@@ -1369,7 +1383,11 @@ func wrapImportedPageContent(content []byte, box pdfBox) []byte {
 	return out.Bytes()
 }
 
-func (doc *Source) collectReferencedObjectsContext(ctx context.Context, data []byte, objects map[ObjRef][]byte, visiting map[ObjRef]bool) error {
+// collectReferencedObjectsContext copies every object reachable from data
+// into objects. budget is the number of body bytes it may still copy: an
+// object without endobj spans the objects after it up to the next endobj, so
+// a chain of them would otherwise copy the rest of the file once per object.
+func (doc *Source) collectReferencedObjectsContext(ctx context.Context, data []byte, objects map[ObjRef][]byte, visiting map[ObjRef]bool, budget *int) error {
 	if err := importContextErr(ctx); err != nil {
 		return err
 	}
@@ -1391,13 +1409,28 @@ func (doc *Source) collectReferencedObjectsContext(ctx context.Context, data []b
 		if err != nil {
 			return err
 		}
+		if len(body) > *budget {
+			return errors.New("PDF referenced objects exceed the source size")
+		}
+		*budget -= len(body)
 		objects[ref] = append([]byte(nil), body...)
-		if err := doc.collectReferencedObjectsContext(ctx, pdfObjectReferenceSection(body), objects, visiting); err != nil {
+		if err := doc.collectReferencedObjectsContext(ctx, pdfObjectReferenceSection(body), objects, visiting, budget); err != nil {
 			return err
 		}
 		visiting[ref] = false
 	}
 	return nil
+}
+
+// referencedObjectBytes bounds the bytes one page may copy from referenced
+// objects. Bodies are spans of the source, so distinct objects that do not
+// overlap fit in its size; the headroom covers repaired stream headers.
+func (doc *Source) referencedObjectBytes() int {
+	size := len(doc.data)
+	if doc.data == nil {
+		size = int(doc.readerSize)
+	}
+	return size + 1<<20
 }
 
 func (doc *Source) maxReferencedObjects() int {
@@ -1437,7 +1470,10 @@ func (doc *Source) objectBodyContext(ctx context.Context, ref ObjRef) ([]byte, e
 		if err != nil {
 			return nil, err
 		}
-		doc.cache[ref] = body
+		if doc.readerAtCached+len(body) <= doc.referencedObjectBytes() {
+			doc.readerAtCached += len(body)
+			doc.cache[ref] = body
+		}
 		return body, nil
 	}
 	if err := importContextErr(ctx); err != nil {
@@ -1482,7 +1518,9 @@ func (doc *Source) readerAtObjectBodyContext(ctx context.Context, ref ObjRef, of
 			return nil, err
 		}
 		if body, ok, err := doc.objectBodyFromBytesContext(ctx, ref, data, size >= limit); err != nil || ok {
-			return body, err
+			// The body is copied out of the read window, which is at least 64 KB
+			// and would otherwise stay alive for as long as the body is cached.
+			return bytes.Clone(body), err
 		}
 		// Halving an odd limit and doubling it back never reaches the limit, so
 		// the window is capped at the limit and the loop ends once it got there.

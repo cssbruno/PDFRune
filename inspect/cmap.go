@@ -127,7 +127,7 @@ func parseToUnicodeCMap(ctx context.Context, data []byte) (*pdfToUnicode, []pdfC
 		switch section {
 		case cmapCodeSpace:
 			if len(operands) == 2 {
-				if space, ok := newPDFCodeSpace(operands[0].raw, operands[1].raw); ok {
+				if space, ok := newPDFCodeSpace(operands[0].raw, operands[1].raw); ok && len(spaces) < maxCodeSpaces {
 					spaces = append(spaces, space)
 				}
 				entries++
@@ -205,6 +205,9 @@ func cmapCode(raw []byte) (uint32, bool) {
 // utf16BEUnits reads CMap destination bytes as UTF-16BE; a single byte is
 // read as one code unit.
 func utf16BEUnits(raw []byte) []uint16 {
+	if len(raw) > maxCMapTextBytes {
+		return nil
+	}
 	if len(raw) == 1 {
 		return []uint16{uint16(raw[0])}
 	}

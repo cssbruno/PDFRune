@@ -189,6 +189,15 @@ type pdfResourceObjects struct {
 	integers map[streamObjectRef]indirectInteger
 	parsed   map[streamObjectRef]pdfObject
 	budget   *textBudget
+	// streams holds each stream's decode result, failures included, so a
+	// form drawn or a font selected many times is inflated only once.
+	streams map[streamObjectRef]resourceStream
+}
+
+type resourceStream struct {
+	dict pdfObject
+	data []byte
+	ok   bool
 }
 
 // textBudget is the decoded-byte budget shared by page contents, resource
@@ -265,6 +274,35 @@ func (r *pdfResourceObjects) stream(value pdfObject) (pdfObject, []byte, bool, e
 	if r == nil || value.kind != pdfObjectRef {
 		return pdfObject{}, nil, false, nil
 	}
+	if cached, ok := r.streams[value.ref]; ok {
+		if !cached.ok {
+			return cached.dict, nil, false, nil
+		}
+		// Every use is still charged: drawing a form again interprets its
+		// content again.
+		if err := r.budget.charge(len(cached.data)); err != nil {
+			return cached.dict, nil, false, err
+		}
+		return cached.dict, cached.data, true, nil
+	}
+	dict, decoded, ok, err := r.decodeStream(value)
+	if err != nil {
+		return dict, nil, false, err
+	}
+	if r.streams == nil {
+		r.streams = make(map[streamObjectRef]resourceStream)
+	}
+	r.streams[value.ref] = resourceStream{dict: dict, data: decoded, ok: ok}
+	if !ok {
+		return dict, nil, false, nil
+	}
+	if err := r.budget.charge(len(decoded)); err != nil {
+		return dict, nil, false, err
+	}
+	return dict, decoded, true, nil
+}
+
+func (r *pdfResourceObjects) decodeStream(value pdfObject) (pdfObject, []byte, bool, error) {
 	body, ok := r.bodies[value.ref]
 	if !ok {
 		return pdfObject{}, nil, false, nil
@@ -296,9 +334,6 @@ func (r *pdfResourceObjects) stream(value pdfObject) (pdfObject, []byte, bool, e
 		}
 	} else if len(decoded) > maxResourceStreamSize {
 		return dict, nil, false, nil
-	}
-	if err := r.budget.charge(len(decoded)); err != nil {
-		return dict, nil, false, err
 	}
 	return dict, decoded, true, nil
 }

@@ -758,6 +758,13 @@ func verifyPublicKeySignature(publicKey any, digest crypto.Hash, hashed, signatu
 	switch key := publicKey.(type) {
 	case *rsa.PublicKey:
 		if pss != nil {
+			// The salt length comes from the CMS. crypto/rsa computes
+			// emLen-hLen-sLen-2 without checking for overflow, so a salt near
+			// MaxInt64 wraps that check and panics on a negative slice bound;
+			// no valid signature has a salt longer than the encoding allows.
+			if pss.SaltLength > (key.N.BitLen()+6)/8-digest.Size()-2 {
+				return errors.New("pdfsigning: RSASSA-PSS salt length exceeds the key size")
+			}
 			return rsa.VerifyPSS(key, digest, hashed, signature, pss)
 		}
 		return rsa.VerifyPKCS1v15(key, digest, hashed, signature)

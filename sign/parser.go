@@ -72,6 +72,11 @@ type pdfXrefResolver struct {
 	// containerBudget bounds the bytes decoded from xref and object streams.
 	objectStreams   map[int]*pdfObjectStream
 	containerBudget int
+	// valueBytes counts the bytes of uncompressed indirect values read, and
+	// xrefStreamRows the rows read from xref streams; both bound work that
+	// would otherwise grow faster than the input (see their checks).
+	valueBytes     int
+	xrefStreamRows int
 }
 
 func analyzePDF(input []byte) (pdfContext, error) {

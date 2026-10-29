@@ -16,6 +16,13 @@ const (
 	defaultGlyphWidth    = 0.5
 	glyphUnitsPerEm      = 1000
 	defaultCIDGlyphWidth = 1000
+	// maxCMapTextBytes bounds one CMap destination (128 UTF-16 units, far
+	// past any ligature); text is produced per glyph, so a destination of
+	// megabytes would be copied for every glyph shown.
+	maxCMapTextBytes = 256
+	// maxCodeSpaces bounds the codespace ranges read from a CMap, which are
+	// tried in turn for every glyph; real CMaps declare a handful.
+	maxCodeSpaces = 256
 )
 
 // pdfFont decodes the character codes of one font resource to Unicode and

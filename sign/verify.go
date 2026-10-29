@@ -734,6 +734,15 @@ func (resolver *pdfXrefResolver) indirectValueContext(ctx context.Context, ref p
 		data, err = resolver.compressedValueContext(ctx, ref, entry)
 	} else {
 		data, start, err = readIndirectValuePositionContext(ctx, resolver.input, ref, entry.Offset)
+		if err == nil {
+			// Values of distinct objects fit in the file unless their spans
+			// overlap: a string holding the next object's text, whose string
+			// holds the next, makes 10000 fields scan the file 10000 times.
+			resolver.valueBytes += len(data)
+			if resolver.valueBytes > 4*len(resolver.input)+1<<20 {
+				return nil, 0, errors.New("pdfsigning: indirect objects overlap beyond the PDF size")
+			}
+		}
 	}
 	if err != nil {
 		return nil, 0, err

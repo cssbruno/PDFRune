@@ -21,6 +21,33 @@
   still not applied).
 - `importpdf` repair leaves out object numbers past `MaxXrefEntries`, which
   made a 133-byte file allocate about 1.9 GB.
+- `importpdf` normalization leaves out object numbers past 1,600,000 and
+  checks the rewritten xref table against the source limit before writing it;
+  a 1 KB classic file naming object 300000000000 exhausted memory.
+- `importpdf` page reads copy at most the source size (plus 1 MB) from
+  referenced objects, so a chain of objects without `endobj` no longer copies
+  the rest of the file once per object.
+- `importpdf` sources opened with `OpenReaderAt` copy each object out of its
+  read window before caching it, and stop caching once cached bodies reach
+  the source size; tiny objects previously kept 64 KB–32 MB windows alive.
+- `sign` rejects an RSASSA-PSS salt length longer than the signer key allows
+  before calling `crypto/rsa`, whose length check a salt near MaxInt64 wrapped
+  into a panic.
+- `importpdf` rejects an object stream whose `/N` exceeds what its header can
+  hold before allocating for it; reconstruction skips such streams, so 2000
+  tiny ones allocated 3 GB.
+- `importpdf` decodes a stream named several times in one page's `/Contents`
+  array once; a stream that inflates to nothing, which the page content limit
+  never charges, was inflated once per entry.
+- `inspect` decodes each resource stream once per extraction, failures
+  included, so a Form XObject drawn many times or a font selected many times
+  is not inflated again (still charged to the budget per use).
+- `inspect` ignores CMap destinations longer than 256 bytes and codespace
+  ranges past the 256th; both were processed for every glyph shown.
+- `sign` bounds the bytes read from indirect objects at four times the file
+  size, so objects whose spans nest each other cannot make AcroForm scanning
+  quadratic, and bounds the rows of all xref streams of a `/Prev` chain at
+  four times `MaxXrefEntries`.
 - `sign` writes non-ASCII signature dictionary text (`/Name`, `/Reason`,
   `/Location`, `/ContactInfo`, field `/T`) as UTF-16BE instead of `?`.
 - `sign` verification and extraction read cross-reference streams, hybrid

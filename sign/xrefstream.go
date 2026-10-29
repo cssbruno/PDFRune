@@ -85,6 +85,13 @@ func (resolver *pdfXrefResolver) loadXrefStreamContext(ctx context.Context, offs
 			return -1, err
 		}
 	}
+	// Each section is bounded on its own, but a 600-byte stream can inflate to
+	// 500000 rows and the /Prev chain repeats that 128 times; rows of all xref
+	// streams share a budget of four full tables.
+	if totalEntries > 4*maxXrefEntries-resolver.xrefStreamRows {
+		return -1, errors.New("pdfsigning: xref streams exceed maximum size")
+	}
+	resolver.xrefStreamRows += totalEntries
 	decoded, err := resolver.decodeContainerStreamContext(ctx, stream)
 	if err != nil {
 		return -1, fmt.Errorf("pdfsigning: invalid xref stream: %w", err)

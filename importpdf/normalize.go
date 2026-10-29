@@ -212,7 +212,7 @@ func (n *pdfNormalizer) parseXrefStream(ctx context.Context, offset int) (pdfDic
 	pos := 0
 	for i := 0; i < len(sections); i += 2 {
 		first, count := sections[i], sections[i+1]
-		if count > MaxXrefEntries-n.doc.xrefEntries || first > MaxXrefEntries*16 {
+		if count > MaxXrefEntries-n.doc.xrefEntries || first > maxXrefObjectNumber {
 			return nil, errors.New("PDF xref entry count exceeds maximum size")
 		}
 		n.doc.xrefEntries += count
@@ -400,6 +400,12 @@ func (n *pdfNormalizer) splitObjectStreamContext(ctx context.Context, streamNumb
 	if err != nil || first < 0 || first > len(decoded) {
 		return nil, nil, fmt.Errorf("PDF object stream %d has an invalid First", streamNumber)
 	}
+	// Each header pair takes at least 4 bytes ("0 0 "), so a larger N cannot
+	// be honest; checking it first keeps reconstruction, which skips streams
+	// that fail to split, from allocating /N-sized slices once per stream.
+	if count > (first+1)/4 {
+		return nil, nil, fmt.Errorf("PDF object stream %d has an invalid N", streamNumber)
+	}
 	numbers := make([]int, count)
 	offsets := make([]int, count)
 	pos := 0
@@ -452,9 +458,12 @@ func (n *pdfNormalizer) objectStreamMembersContext(ctx context.Context, ref ObjR
 }
 
 func (n *pdfNormalizer) write(ctx context.Context, security *pdfSecurityHandler, maxBytes int64) ([]byte, error) {
+	// The written table has one row per object number up to the largest, so
+	// a classic subsection naming object 300000000000 would size it to
+	// terabytes; numbers past the limit are left out, as in repair.
 	refs := make([]ObjRef, 0, len(n.doc.offsets)+len(n.packed))
 	for ref := range n.doc.offsets {
-		if !n.skip[ref.num] {
+		if !n.skip[ref.num] && ref.num <= maxXrefObjectNumber {
 			refs = append(refs, ref)
 		}
 	}
@@ -507,10 +516,18 @@ func (n *pdfNormalizer) write(ctx context.Context, security *pdfSecurityHandler,
 	if !ok {
 		return nil, errors.New("PDF trailer does not contain a root catalog")
 	}
+	if int64(out.Len())+20*int64(maxNumber+1) > maxBytes {
+		return nil, ErrSourceTooLarge
+	}
 	xrefOffset := out.Len()
 	fmt.Fprintf(&out, "xref\n0 %d\n", maxNumber+1)
 	out.WriteString("0000000000 65535 f\r\n")
 	for number := 1; number <= maxNumber; number++ {
+		if number%4096 == 0 {
+			if err := importContextErr(ctx); err != nil {
+				return nil, err
+			}
+		}
 		ref, ok := offsets[number]
 		if !ok {
 			out.WriteString("0000000000 00000 f\r\n")
